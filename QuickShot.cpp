@@ -47,7 +47,7 @@ using namespace Gdiplus;
 // 常量与全局状态
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME    = L"QuickShot";
-static const wchar_t* APP_VERSION = L"1.1";
+static const wchar_t* APP_VERSION = L"1.2";
 
 #define WM_TRAY_MSG        (WM_APP + 10)
 #define WM_KB_CHANGED      (WM_APP + 11)
@@ -72,7 +72,7 @@ enum {
 // 窗口类名
 #define CLS_MAIN     L"QS_MainWnd"
 #define CLS_KEYBOX   L"QS_KeyBox"
-#define CLS_INPUT    L"QS_InputBox"
+#define CLS_NEWFOLDER L"QS_NewFolder"
 #define CLS_SETTINGS L"QS_Settings"
 
 struct Config {
@@ -1243,18 +1243,84 @@ static LRESULT CALLBACK KeyBoxProc(HWND h, UINT m, WPARAM w, LPARAM l)
 }
 
 // ---------------------------------------------------------------------------
-// 单行输入框
+// 新建文件夹对话框
+//   在本程序内直接给文件夹命名：实时显示完整路径、重名检测、Enter 确认
 // ---------------------------------------------------------------------------
-struct InputState {
-    std::wstring value;
-    std::wstring prompt;
-    bool ok = false;
-    HWND hEdit = nullptr;
+#define IDC_NF_EDIT  300
+
+struct NFState {
+    std::wstring root;            // 建在哪个目录下
+    std::wstring name;            // 用户输入的名称
+    bool ok      = false;
+    bool existed = false;         // 该文件夹本来就存在，用户选择直接切换
+    HWND hEdit   = nullptr;
+    HWND hPreview = nullptr;
 };
 
-static LRESULT CALLBACK InputProc(HWND h, UINT m, WPARAM w, LPARAM l)
+static bool IsDirThere(const std::wstring& dir)
 {
-    InputState* st = (InputState*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    DWORD a = GetFileAttributesW(dir.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static std::wstring TrimSpace(const std::wstring& in)
+{
+    std::wstring s = in;
+    while (!s.empty() && (s.front() == L' ' || s.front() == L'\t')) s.erase(s.begin());
+    while (!s.empty() && (s.back()  == L' ' || s.back()  == L'\t')) s.pop_back();
+    return s;
+}
+
+static std::wstring NFJoin(const std::wstring& root, const std::wstring& name)
+{
+    std::wstring r = root;
+    while (!r.empty() && (r.back() == L'\\' || r.back() == L'/')) r.pop_back();
+    if (name.empty()) return r;
+    return r + L"\\" + name;
+}
+
+// 输入时实时刷新「将创建在」路径，并提示重名
+static void NFUpdatePreview(NFState* st)
+{
+    if (!st->hPreview || !st->hEdit) return;
+
+    wchar_t buf[512] = {0};
+    GetWindowTextW(st->hEdit, buf, 512);
+    std::wstring n = TrimSpace(buf);
+
+    if (n.empty()) {
+        SetWindowTextW(st->hPreview, (st->root + L"\\（请在上面输入名称）").c_str());
+        return;
+    }
+
+    std::wstring full = NFJoin(st->root, n);
+    std::wstring text = full + (IsDirThere(full) ? L"   ← 已存在，确定后直接切换过去" : L"");
+    SetWindowTextW(st->hPreview, text.c_str());
+}
+
+// 自建窗口没有 DefDlgProc，IsDialogMessage 拿不到默认按钮，
+// 所以回车/Esc 必须自己在输入框里拦下来
+static WNDPROC g_nfOldEdit = nullptr;
+
+static LRESULT CALLBACK NFEditProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    if (m == WM_KEYDOWN) {
+        if (w == VK_RETURN) {
+            PostMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED), 0);
+            return 0;
+        }
+        if (w == VK_ESCAPE) {
+            PostMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), 0);
+            return 0;
+        }
+    }
+    if (m == WM_CHAR && (w == L'\r' || w == L'\n')) return 0;   // 别让编辑框发出提示音
+    return CallWindowProcW(g_nfOldEdit, h, m, w, l);
+}
+
+static LRESULT CALLBACK NewFolderProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    NFState* st = (NFState*)GetWindowLongPtrW(h, GWLP_USERDATA);
 
     switch (m) {
     case WM_NCCREATE: {
@@ -1263,45 +1329,103 @@ static LRESULT CALLBACK InputProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return TRUE;
     }
     case WM_CREATE: {
-        InputState* s = (InputState*)GetWindowLongPtrW(h, GWLP_USERDATA);
-        CreateWindowExW(0, L"STATIC", s->prompt.c_str(), WS_CHILD | WS_VISIBLE,
-                        S(16), S(18), S(340), S(20), h, nullptr, g_hInst, nullptr);
-        HWND e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", s->value.c_str(),
+        NFState* s = (NFState*)GetWindowLongPtrW(h, GWLP_USERDATA);
+
+        CreateWindowExW(0, L"STATIC", L"文件夹名称：", WS_CHILD | WS_VISIBLE,
+                        S(20), S(18), S(200), S(20), h, nullptr, g_hInst, nullptr);
+
+        HWND e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", s->name.c_str(),
                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                 S(16), S(44), S(340), S(26), h, (HMENU)100, g_hInst, nullptr);
+                                 S(20), S(42), S(420), S(28), h,
+                                 (HMENU)IDC_NF_EDIT, g_hInst, nullptr);
         s->hEdit = e;
-        SendMessageW(e, WM_SETFONT, (WPARAM)g_font, TRUE);
-        SendMessageW(e, EM_SETSEL, 0, -1);
-        SetFocus(e);
+
+        CreateWindowExW(0, L"STATIC", L"将创建在：", WS_CHILD | WS_VISIBLE,
+                        S(20), S(86), S(200), S(20), h, nullptr, g_hInst, nullptr);
+
+        s->hPreview = CreateWindowExW(0, L"STATIC", L"",
+                                      WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
+                                      S(20), S(108), S(420), S(40), h, nullptr, g_hInst, nullptr);
+
+        CreateWindowExW(0, L"STATIC", L"创建后立即切换为当前保存目录，之后的截图都存进这个文件夹。",
+                        WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        S(20), S(152), S(420), S(20), h, nullptr, g_hInst, nullptr);
 
         HWND b1 = CreateWindowExW(0, L"BUTTON", L"确定",
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                  S(196), S(84), S(76), S(28), h, (HMENU)IDOK, g_hInst, nullptr);
+                                  S(280), S(190), S(76), S(30), h, (HMENU)IDOK, g_hInst, nullptr);
         HWND b2 = CreateWindowExW(0, L"BUTTON", L"取消",
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                  S(280), S(84), S(76), S(28), h, (HMENU)IDCANCEL, g_hInst, nullptr);
-        SendMessageW(b1, WM_SETFONT, (WPARAM)g_font, TRUE);
-        SendMessageW(b2, WM_SETFONT, (WPARAM)g_font, TRUE);
+                                  S(364), S(190), S(76), S(30), h, (HMENU)IDCANCEL, g_hInst, nullptr);
 
-        // 静态文本字体
         for (HWND c = GetWindow(h, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT))
             SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE);
+        (void)b1; (void)b2;
+
+        g_nfOldEdit = (WNDPROC)SetWindowLongPtrW(e, GWLP_WNDPROC, (LONG_PTR)NFEditProc);
+
+        SendMessageW(e, EM_SETSEL, 0, -1);
+        NFUpdatePreview(s);
         return 0;
     }
-    case WM_COMMAND:
-        if (LOWORD(w) == IDOK) {
+    case WM_COMMAND: {
+        UINT id   = LOWORD(w);
+        UINT code = HIWORD(w);
+
+        if (id == IDC_NF_EDIT && code == EN_CHANGE) {
+            NFUpdatePreview(st);
+            return 0;
+        }
+
+        if (id == IDOK) {
             wchar_t buf[512] = {0};
             GetWindowTextW(st->hEdit, buf, 512);
-            st->value = buf;
-            st->ok = true;
+            std::wstring name = TrimSpace(buf);
+
+            if (name.empty()) {
+                MessageBoxW(h, L"请先输入文件夹名称。", APP_NAME, MB_ICONWARNING | MB_OK);
+                SetFocus(st->hEdit);
+                return 0;
+            }
+            if (name == L"." || name == L"..") {
+                MessageBoxW(h, L"这个名字不能用作文件夹名。", APP_NAME, MB_ICONWARNING | MB_OK);
+                return 0;
+            }
+            if (name.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos) {
+                MessageBoxW(h, L"名称不能包含下列字符：\n\\ / : * ? \" < > |",
+                            APP_NAME, MB_ICONWARNING | MB_OK);
+                return 0;
+            }
+            if (name.back() == L'.' || name.back() == L' ') {
+                MessageBoxW(h, L"名称不能以点或空格结尾。", APP_NAME, MB_ICONWARNING | MB_OK);
+                return 0;
+            }
+            if (name.size() > 120) {
+                MessageBoxW(h, L"名称太长了，请控制在 120 个字符以内。",
+                            APP_NAME, MB_ICONWARNING | MB_OK);
+                return 0;
+            }
+
+            std::wstring full = NFJoin(st->root, name);
+            if (IsDirThere(full)) {
+                std::wstring q = L"文件夹「" + name + L"」已经存在。\n\n是否直接切换到它？";
+                if (MessageBoxW(h, q.c_str(), APP_NAME, MB_ICONQUESTION | MB_YESNO) != IDYES)
+                    return 0;
+                st->existed = true;
+            }
+
+            st->name = name;
+            st->ok   = true;
             DestroyWindow(h);
             return 0;
         }
-        if (LOWORD(w) == IDCANCEL) {
+
+        if (id == IDCANCEL) {
             DestroyWindow(h);
             return 0;
         }
         break;
+    }
     case WM_CLOSE:
         DestroyWindow(h);
         return 0;
@@ -1311,30 +1435,37 @@ static LRESULT CALLBACK InputProc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcW(h, m, w, l);
 }
 
-static bool InputBox(HWND owner, const std::wstring& title,
-                     const std::wstring& prompt, std::wstring* value)
+// 弹出命名窗口；返回 true 时 out 里是用户确认的文件夹名
+static bool NewFolderDialog(HWND owner, const std::wstring& root, NFState* out)
 {
-    InputState st;
-    st.value  = *value;
-    st.prompt = prompt;
+    NFState st;
+    st.root = root;
+    st.name = L"新建文件夹";
 
-    int cw = S(388), ch = S(150);
+    // 客户区 460x228，外框尺寸由 AdjustWindowRectEx 算，避免按钮被标题栏挤掉
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    RECT rc = { 0, 0, S(460), S(228) };
+    AdjustWindowRectEx(&rc, style, FALSE, WS_EX_DLGMODALFRAME);
+    int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+
     int x = (GetSystemMetrics(SM_CXSCREEN) - cw) / 2;
     int y = (GetSystemMetrics(SM_CYSCREEN) - ch) / 2;
 
-    HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, CLS_INPUT, title.c_str(),
-                             WS_POPUP | WS_CAPTION | WS_SYSMENU,
-                             x, y, cw, ch, owner, nullptr, g_hInst, &st);
+    HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, CLS_NEWFOLDER, L"新建文件夹",
+                             style, x, y, cw, ch, owner, nullptr, g_hInst, &st);
     if (!h) return false;
 
     ShowWindow(h, SW_SHOW);
     UpdateWindow(h);
     SetForegroundWindow(h);
-    SetFocus(st.hEdit);          // 窗口显示后才能成功设置焦点
+
+    // 预填「新建文件夹」并全选，直接打字即可覆盖
+    SetFocus(st.hEdit);
+    SendMessageW(st.hEdit, EM_SETSEL, 0, -1);
 
     RunModal(h, nullptr);
     if (!IsWindow(h)) {
-        if (st.ok && value) *value = st.value;
+        if (st.ok && out) *out = st;
         return st.ok;
     }
     DestroyWindow(h);
@@ -1596,33 +1727,29 @@ static void DoCapture()
 
 static void CreateNewFolder()
 {
-    std::wstring name;
-    if (!InputBox(g_hwndMain, L"新建文件夹", L"请输入文件夹名称（将建在当前根目录下）：", &name))
-        return;
-
-    name = SanitizeFolderName(name);
-    if (name.empty()) {
-        MessageBoxW(g_hwndMain, L"文件夹名称无效。", APP_NAME, MB_ICONWARNING | MB_OK);
-        return;
-    }
-
     if (!EnsureDir(g_cfg.baseDir)) {
         MessageBoxW(g_hwndMain, (L"无法创建根目录：\n" + g_cfg.baseDir).c_str(),
                     APP_NAME, MB_ICONERROR | MB_OK);
         return;
     }
 
-    std::wstring full = g_cfg.baseDir + L"\\" + name;
-    if (!EnsureDir(full)) {
+    NFState nf;
+    if (!NewFolderDialog(g_hwndMain, g_cfg.baseDir, &nf)) return;   // 用户取消
+
+    std::wstring full = NFJoin(g_cfg.baseDir, nf.name);
+
+    if (!nf.existed && !EnsureDir(full)) {
         MessageBoxW(g_hwndMain, (L"创建文件夹失败：\n" + full).c_str(),
                     APP_NAME, MB_ICONERROR | MB_OK);
         return;
     }
 
-    // 新建后立即切换为当前保存目录
-    g_cfg.subDir = name;
+    // 建好（或选中已有）后立即切换为当前保存目录
+    g_cfg.subDir = nf.name;
     SaveConfig();
-    Balloon(L"已切换保存目录", name);
+
+    Balloon(nf.existed ? L"已切换到已有文件夹" : L"已新建并切换",
+            nf.name + L"\n" + full);
 }
 
 // ---------------------------------------------------------------------------
@@ -1653,6 +1780,7 @@ static void ShowAppMenu(POINT pt)
     AppendMenuW(sub, MF_STRING, IDM_CHOOSE_BASE, L"更改根目录…");
 
     AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, L"保存位置");
+    AppendMenuW(m, MF_STRING, IDM_NEW_FOLDER, L"新建文件夹…（自己命名）");
     AppendMenuW(m, MF_STRING, IDM_OPEN_FOLDER, L"打开保存文件夹");
     AppendMenuW(m, MF_STRING | (g_cfg.ball ? MF_CHECKED : 0),
                 IDM_TOGGLE_BALL, L"显示悬浮球");
@@ -1853,8 +1981,8 @@ static bool RegisterClasses()
     wc.hbrBackground = nullptr;
     if (!RegisterClassExW(&wc)) return false;
 
-    wc.lpfnWndProc   = InputProc;
-    wc.lpszClassName = CLS_INPUT;
+    wc.lpfnWndProc   = NewFolderProc;
+    wc.lpszClassName = CLS_NEWFOLDER;
     if (!RegisterClassExW(&wc)) return false;
 
     wc.lpfnWndProc   = SettingsProc;
