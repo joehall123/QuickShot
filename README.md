@@ -8,7 +8,7 @@
 
 ## 下载即用
 
-到 [Releases](https://github.com/joehall123/QuickShot/releases/latest) 下载 `QuickShot-1.1-便携版.zip`，
+到 [Releases](https://github.com/joehall123/QuickShot/releases/latest) 下载 `QuickShot-1.1-portable.zip`，
 解压后双击 `QuickShot.exe` 即可，无需安装、无需编译。绿色便携，可直接放在 U 盘里跨机器使用
 （配置与截图都留在 exe 同目录，换盘符不受影响）。
 
