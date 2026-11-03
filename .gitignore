@@ -1,0 +1,21 @@
+# 编译产物（U盘版/ 目录下的发布 exe 会正常提交，这里只忽略根目录的构建输出）
+/*.exe
+*.obj
+*.o
+*.res
+*.ilk
+*.pdb
+*.exp
+*.lib
+*.map
+
+# 运行时生成
+quickshot.ini
+Screenshots/
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.vs/
+.vscode/
+*.zip

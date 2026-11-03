@@ -1,0 +1,10 @@
+* text=auto
+
+# Windows 批处理必须是 CRLF + GBK，避免 cmd 解析中文乱码
+*.bat  text eol=crlf
+*.rc   text eol=crlf
+*.manifest text eol=crlf
+
+# 便携包里的说明文件是 GBK 编码（给 Windows 记事本用），不要让 git 当作文本处理
+U盘版/使用说明.txt -text
+*.exe -text
