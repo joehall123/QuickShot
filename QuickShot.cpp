@@ -7,6 +7,7 @@
 //    3. 自动保存到「图片\Screenshots」，可自建并命名子文件夹
 //    4. 支持 PNG / JPEG / BMP，文件名前缀可自定义
 //    5. 可选开机自启、截图后气泡提示
+//    6. 区域 / 窗口截图：拖框选区域、单击选窗口、W 窗口吸附、F 整屏
 //
 //  构建：见 build_msvc.bat / build_mingw.bat
 // ============================================================================
@@ -47,13 +48,14 @@ using namespace Gdiplus;
 // 常量与全局状态
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME    = L"QuickShot";
-static const wchar_t* APP_VERSION = L"1.2";
+static const wchar_t* APP_VERSION = L"1.3";
 
 #define WM_TRAY_MSG        (WM_APP + 10)
 #define WM_KB_CHANGED      (WM_APP + 11)
 
 #define ID_TRAY_ICON       1
 #define ID_HOTKEY_CAPTURE  101
+#define ID_HOTKEY_SELECT   102
 
 // 菜单命令
 enum {
@@ -65,6 +67,7 @@ enum {
     IDM_TOGGLE_BALL,
     IDM_ABOUT,
     IDM_EXIT,
+    IDM_SELECT,                // 区域 / 窗口截图（菜单入口）
     IDM_FOLDER_BASE = 1100,
     IDM_FOLDER_ITEM = 2000      // 动态子文件夹项起点
 };
@@ -74,10 +77,14 @@ enum {
 #define CLS_KEYBOX   L"QS_KeyBox"
 #define CLS_NEWFOLDER L"QS_NewFolder"
 #define CLS_SETTINGS L"QS_Settings"
+#define CLS_SELECT   L"QS_SelectWnd"
+#define CLS_PREVIEW  L"QS_PreviewWnd"
 
 struct Config {
-    UINT         mod   = MOD_CONTROL | MOD_ALT;   // 修饰键
-    UINT         vk    = 'A';                     // 主键
+    UINT         mod   = MOD_CONTROL | MOD_ALT;   // 全屏截图热键的修饰键
+    UINT         vk    = 'A';                     // 全屏截图热键的主键
+    UINT         mod2  = MOD_CONTROL | MOD_ALT;   // 区域截图热键的修饰键
+    UINT         vk2   = 'S';                     // 区域截图热键的主键
     std::wstring baseDir;                         // 根目录
     std::wstring subDir;                          // 当前子文件夹（空=根目录）
     int          format = 0;                      // 0=PNG 1=JPEG 2=BMP
@@ -108,6 +115,7 @@ static bool  g_portable = false;   // true = 同目录可写，按 U 盘便携�
 
 // 前向声明（悬浮球与托盘菜单互相引用）
 static void DoCapture();
+static void DoSelectCapture();
 static void ShowAppMenu(POINT pt);
 static void ShowSettings();
 static void BallShow(bool show);
@@ -249,6 +257,8 @@ static void LoadConfig()
 
     g_cfg.mod  = (UINT)GetPrivateProfileIntW(L"hotkey", L"mod", MOD_CONTROL | MOD_ALT, f.c_str());
     g_cfg.vk   = (UINT)GetPrivateProfileIntW(L"hotkey", L"vk", 'A', f.c_str());
+    g_cfg.mod2 = (UINT)GetPrivateProfileIntW(L"hotkey", L"mod2", MOD_CONTROL | MOD_ALT, f.c_str());
+    g_cfg.vk2  = (UINT)GetPrivateProfileIntW(L"hotkey", L"vk2", 'S', f.c_str());
 
     GetPrivateProfileStringW(L"save", L"baseDir", L"", buf, 1024, f.c_str());
     g_cfg.baseDir = StoredToPath(buf);
@@ -277,6 +287,8 @@ static void SaveConfig()
     std::wstring f = ConfigPath();
     WritePrivateProfileStringW(L"hotkey", L"mod", ItoS((int)g_cfg.mod).c_str(), f.c_str());
     WritePrivateProfileStringW(L"hotkey", L"vk",  ItoS((int)g_cfg.vk).c_str(),  f.c_str());
+    WritePrivateProfileStringW(L"hotkey", L"mod2", ItoS((int)g_cfg.mod2).c_str(), f.c_str());
+    WritePrivateProfileStringW(L"hotkey", L"vk2",  ItoS((int)g_cfg.vk2).c_str(),  f.c_str());
     std::wstring storedBase = PathToStored(g_cfg.baseDir);
     WritePrivateProfileStringW(L"save", L"baseDir", storedBase.c_str(), f.c_str());
     WritePrivateProfileStringW(L"save", L"subDir",  g_cfg.subDir.c_str(),  f.c_str());
@@ -545,14 +557,32 @@ static std::wstring MakeFilePath()
     return path;
 }
 
-static bool CaptureAndSave(std::wstring* outPath, std::wstring* err)
-{
-    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+// ---------------------------------------------------------------------------
+// 抓屏与保存
+//   一次 BitBlt 得到整块虚拟桌面的 DIB；整屏截图与区域截图共用同一份像素，
+//   区域模式只是从中裁一个矩形，避免二次抓屏时画面已经变化。
+// ---------------------------------------------------------------------------
+struct ScreenImage {
+    HBITMAP hbm  = nullptr;
+    BYTE*   bits = nullptr;          // 32bpp，自上而下，行跨距 = w * 4
+    int     w = 0, h = 0;            // 虚拟桌面宽高
+    int     vx = 0, vy = 0;          // 虚拟桌面左上角（多显示器时可为负）
 
-    if (vw <= 0 || vh <= 0) {
+    void Free()
+    {
+        if (hbm) { DeleteObject(hbm); hbm = nullptr; }
+        bits = nullptr;
+        w = h = 0;
+    }
+};
+
+static bool GrabScreen(ScreenImage* img, std::wstring* err)
+{
+    img->vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    img->vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    img->w  = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    img->h  = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (img->w <= 0 || img->h <= 0) {
         if (err) *err = L"无法获取屏幕尺寸。";
         return false;
     }
@@ -562,7 +592,6 @@ static bool CaptureAndSave(std::wstring* outPath, std::wstring* err)
         if (err) *err = L"获取屏幕设备上下文失败。";
         return false;
     }
-
     HDC hMem = CreateCompatibleDC(hScreen);
     if (!hMem) {
         ReleaseDC(nullptr, hScreen);
@@ -572,8 +601,8 @@ static bool CaptureAndSave(std::wstring* outPath, std::wstring* err)
 
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth       = vw;
-    bmi.bmiHeader.biHeight      = -vh;      // 负数 = 自上而下
+    bmi.bmiHeader.biWidth       = img->w;
+    bmi.bmiHeader.biHeight      = -img->h;      // 负数 = 自上而下
     bmi.bmiHeader.biPlanes      = 1;
     bmi.bmiHeader.biBitCount    = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -581,6 +610,7 @@ static bool CaptureAndSave(std::wstring* outPath, std::wstring* err)
     void* bits = nullptr;
     HBITMAP hbm = CreateDIBSection(hScreen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (!hbm || !bits) {
+        if (hbm) DeleteObject(hbm);
         DeleteDC(hMem);
         ReleaseDC(nullptr, hScreen);
         if (err) *err = L"创建位图失败（可能内存不足）。";
@@ -588,41 +618,80 @@ static bool CaptureAndSave(std::wstring* outPath, std::wstring* err)
     }
 
     HGDIOBJ old = SelectObject(hMem, hbm);
-
     // CAPTUREBLT 让分层窗口（如某些播放器、菜单）也能被截到
-    BOOL ok = BitBlt(hMem, 0, 0, vw, vh, hScreen, vx, vy, SRCCOPY | CAPTUREBLT);
+    BOOL ok = BitBlt(hMem, 0, 0, img->w, img->h,
+                     hScreen, img->vx, img->vy, SRCCOPY | CAPTUREBLT);
     GdiFlush();
     SelectObject(hMem, old);
+    DeleteDC(hMem);
+    ReleaseDC(nullptr, hScreen);
 
     if (!ok) {
         DeleteObject(hbm);
-        DeleteDC(hMem);
-        ReleaseDC(nullptr, hScreen);
         if (err) *err = L"屏幕抓取失败。";
+        return false;
+    }
+
+    img->hbm  = hbm;
+    img->bits = (BYTE*)bits;
+    return true;
+}
+
+static int ClampInt(int v, int lo, int hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// area 用 DIB 像素坐标（左上角为 0,0），越界部分自动裁到画面内
+static bool SaveDibRegion(const ScreenImage& img, const RECT& area,
+                          std::wstring* outPath, std::wstring* err)
+{
+    RECT r = area;
+    r.left   = ClampInt(r.left,   0, img.w);
+    r.top    = ClampInt(r.top,    0, img.h);
+    r.right  = ClampInt(r.right,  0, img.w);
+    r.bottom = ClampInt(r.bottom, 0, img.h);
+    int rw = r.right - r.left;
+    int rh = r.bottom - r.top;
+    if (rw <= 0 || rh <= 0 || !img.bits) {
+        if (err) *err = L"选区无效。";
         return false;
     }
 
     std::wstring dir = SaveDir();
     if (!EnsureDir(dir)) {
-        DeleteObject(hbm);
-        DeleteDC(hMem);
-        ReleaseDC(nullptr, hScreen);
         if (err) *err = L"无法创建保存目录：\n" + dir;
         return false;
     }
 
     std::wstring path = MakeFilePath();
-
     const wchar_t* mime = (g_cfg.format == 1) ? L"image/jpeg"
                         : (g_cfg.format == 2) ? L"image/bmp" : L"image/png";
-
     CLSID clsid;
     bool saved = false;
     Status st = GenericError;
 
     if (GetEncoderClsid(mime, &clsid) >= 0) {
         // PixelFormat32bppRGB：忽略 alpha 通道，保证输出不透明
-        Bitmap bmp(vw, vh, vw * 4, PixelFormat32bppRGB, (BYTE*)bits);
+        Bitmap full(img.w, img.h, img.w * 4, PixelFormat32bppRGB, img.bits);
+
+        // 整屏沿用原来的「直接编码 DIB」路径，不额外裁剪，避免回归；
+        // 区域则画到一张独立位图再编码，编码器不必理解外层 DIB 的行跨距。
+        bool whole = (r.left == 0 && r.top == 0 && rw == img.w && rh == img.h);
+        Bitmap* owned  = nullptr;
+        Bitmap* target = &full;
+        if (!whole) {
+            owned = new Bitmap(rw, rh, PixelFormat32bppRGB);
+            Graphics* cg = Graphics::FromImage(owned);
+            if (cg) {
+                cg->DrawImage(&full,
+                              RectF(0.0f, 0.0f, (REAL)rw, (REAL)rh),
+                              (REAL)r.left, (REAL)r.top, (REAL)rw, (REAL)rh,
+                              UnitPixel);
+                delete cg;
+            }
+            target = owned;
+        }
 
         if (g_cfg.format == 1) {
             ULONG quality = 92;
@@ -632,16 +701,13 @@ static bool CaptureAndSave(std::wstring* outPath, std::wstring* err)
             ep.Parameter[0].Type           = EncoderParameterValueTypeLong;
             ep.Parameter[0].NumberOfValues = 1;
             ep.Parameter[0].Value          = &quality;
-            st = bmp.Save(path.c_str(), &clsid, &ep);
+            st = target->Save(path.c_str(), &clsid, &ep);
         } else {
-            st = bmp.Save(path.c_str(), &clsid, nullptr);
+            st = target->Save(path.c_str(), &clsid, nullptr);
         }
+        delete owned;
         saved = (st == Ok);
     }
-
-    DeleteObject(hbm);
-    DeleteDC(hMem);
-    ReleaseDC(nullptr, hScreen);
 
     if (!saved) {
         if (err) *err = L"图片编码失败（GDI+ 状态码 " + ItoS((int)st) + L"）。";
@@ -650,6 +716,16 @@ static bool CaptureAndSave(std::wstring* outPath, std::wstring* err)
 
     if (outPath) *outPath = path;
     return true;
+}
+
+static bool CaptureAndSave(std::wstring* outPath, std::wstring* err)
+{
+    ScreenImage img;
+    if (!GrabScreen(&img, err)) return false;
+    RECT all = { 0, 0, img.w, img.h };
+    bool ok = SaveDibRegion(img, all, outPath, err);
+    img.Free();
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -979,8 +1055,10 @@ static LRESULT CALLBACK BallProc(HWND h, UINT m, WPARAM w, LPARAM l)
 
         if (moved) {
             BallSnapToEdge();      // 拖到位后贴边并记住位置
+        } else if (GetKeyState(VK_SHIFT) & 0x8000) {
+            DoSelectCapture();     // Shift + 单击 = 区域 / 窗口截图
         } else {
-            DoCapture();           // 单击 = 截图
+            DoCapture();           // 单击 = 全屏截图
         }
         return 0;
     }
@@ -1040,7 +1118,9 @@ static void AddTrayIcon()
     g_nid.uCallbackMessage = WM_TRAY_MSG;
     g_nid.hIcon            = g_hiconSmall ? g_hiconSmall : LoadIcon(nullptr, IDI_APPLICATION);
 
-    std::wstring tip = std::wstring(L"QuickShot  ") + HotkeyText(g_cfg.mod, g_cfg.vk) + L" 截图";
+    std::wstring tip = std::wstring(L"QuickShot  ") +
+                       HotkeyText(g_cfg.mod, g_cfg.vk) + L" 全屏 / " +
+                       HotkeyText(g_cfg.mod2, g_cfg.vk2) + L" 区域";
     lstrcpynW(g_nid.szTip, tip.c_str(), 128);
 
     Shell_NotifyIconW(NIM_ADD, &g_nid);
@@ -1048,7 +1128,9 @@ static void AddTrayIcon()
 
 static void UpdateTrayTip()
 {
-    std::wstring tip = std::wstring(L"QuickShot  ") + HotkeyText(g_cfg.mod, g_cfg.vk) + L" 截图";
+    std::wstring tip = std::wstring(L"QuickShot  ") +
+                       HotkeyText(g_cfg.mod, g_cfg.vk) + L" 全屏 / " +
+                       HotkeyText(g_cfg.mod2, g_cfg.vk2) + L" 区域";
     lstrcpynW(g_nid.szTip, tip.c_str(), 128);
     g_nid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
@@ -1117,7 +1199,7 @@ static std::wstring SanitizeFolderName(const std::wstring& in)
 // ---------------------------------------------------------------------------
 // 通用模态循环（非对话框资源实现）
 // ---------------------------------------------------------------------------
-static void RunModal(HWND hwnd, HWND keybox)
+static void RunModal(HWND hwnd, HWND keybox, HWND keybox2 = nullptr)
 {
     g_modal = true;
     MSG msg;
@@ -1129,7 +1211,10 @@ static void RunModal(HWND hwnd, HWND keybox)
             break;
         }
         // 录制快捷键时绕过 IsDialogMessage，否则 Alt/Tab 会被当作助记符吞掉
-        if (keybox && GetFocus() == keybox &&
+        HWND focus = GetFocus();
+        bool inKeyBox = (keybox && focus == keybox) ||
+                        (keybox2 && focus == keybox2);
+        if (inKeyBox &&
             (msg.message == WM_KEYDOWN || msg.message == WM_KEYUP ||
              msg.message == WM_SYSKEYDOWN || msg.message == WM_SYSKEYUP ||
              msg.message == WM_CHAR || msg.message == WM_SYSCHAR)) {
@@ -1193,8 +1278,14 @@ static LRESULT CALLBACK KeyBoxProc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
 
-        g_tmp.mod = mod;
-        g_tmp.vk  = vk;
+        // 控件 207 是「区域截图」热键框，其余是全屏截图热键框
+        if (GetDlgCtrlID(h) == 207) {
+            g_tmp.mod2 = mod;
+            g_tmp.vk2  = vk;
+        } else {
+            g_tmp.mod  = mod;
+            g_tmp.vk   = vk;
+        }
         g_kbRecording = false;
 
         InvalidateRect(h, nullptr, FALSE);
@@ -1223,8 +1314,10 @@ static LRESULT CALLBACK KeyBoxProc(HWND h, UINT m, WPARAM w, LPARAM l)
         DeleteObject(pen);
 
         SetBkMode(dc, TRANSPARENT);
+        bool second = (GetDlgCtrlID(h) == 207);
         std::wstring text = g_kbRecording ? std::wstring(L"请按下组合键…")
-                                          : HotkeyText(g_tmp.mod, g_tmp.vk);
+                            : HotkeyText(second ? g_tmp.mod2 : g_tmp.mod,
+                                         second ? g_tmp.vk2  : g_tmp.vk);
         SetTextColor(dc, g_kbRecording ? RGB(140, 140, 140) : RGB(20, 20, 20));
         HGDIOBJ oldFont = SelectObject(dc, g_font);
         RECT tr = rc;
@@ -1478,6 +1571,7 @@ static bool NewFolderDialog(HWND owner, const std::wstring& root, NFState* out)
 struct SetState {
     bool ok = false;
     HWND hKey = nullptr;
+    HWND hKey2 = nullptr;
     HWND hFmt = nullptr;
     HWND hPrefix = nullptr;
     HWND hPath = nullptr;
@@ -1515,22 +1609,29 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l)
         SetState* s = (SetState*)GetWindowLongPtrW(h, GWLP_USERDATA);
         g_tmp = g_cfg;   // 编辑副本
 
-        MkChild(h, L"BUTTON", L" 快捷键 ", BS_GROUPBOX, 14, 10, 412, 64, 0);
+        MkChild(h, L"BUTTON", L" 快捷键 ", BS_GROUPBOX, 14, 10, 412, 100, 0);
 
-        MkChild(h, L"STATIC", L"组合键：", SS_LEFT, 26, 37, 68, 20, 0);
+        MkChild(h, L"STATIC", L"全屏截图：", SS_LEFT, 26, 37, 68, 20, 0);
         s->hKey = CreateWindowExW(0, CLS_KEYBOX, L"",
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                                   S(94), S(33), S(158), S(28), h,
                                   (HMENU)200, g_hInst, nullptr);
         MkChild(h, L"STATIC", L"点击后直接按下组合键", SS_LEFT, 262, 38, 156, 20, 0);
 
-        MkChild(h, L"BUTTON", L" 保存 ", BS_GROUPBOX, 14, 82, 412, 140, 0);
+        MkChild(h, L"STATIC", L"区域截图：", SS_LEFT, 26, 71, 68, 20, 0);
+        s->hKey2 = CreateWindowExW(0, CLS_KEYBOX, L"",
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                   S(94), S(67), S(158), S(28), h,
+                                   (HMENU)207, g_hInst, nullptr);
+        MkChild(h, L"STATIC", L"拖框选区域 / 单击选窗口", SS_LEFT, 262, 72, 156, 20, 0);
 
-        MkChild(h, L"STATIC", L"图片格式：", SS_LEFT, 26, 110, 72, 20, 0);
+        MkChild(h, L"BUTTON", L" 保存 ", BS_GROUPBOX, 14, 118, 412, 140, 0);
+
+        MkChild(h, L"STATIC", L"图片格式：", SS_LEFT, 26, 146, 72, 20, 0);
         s->hFmt = CreateWindowExW(0, L"COMBOBOX", L"",
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP |
                                   CBS_DROPDOWNLIST | WS_VSCROLL,
-                                  S(102), S(107), S(90), S(200), h,
+                                  S(102), S(143), S(90), S(200), h,
                                   (HMENU)201, g_hInst, nullptr);
         SendMessageW(s->hFmt, WM_SETFONT, (WPARAM)g_font, TRUE);
         SendMessageW(s->hFmt, CB_ADDSTRING, 0, (LPARAM)L"PNG");
@@ -1538,25 +1639,25 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l)
         SendMessageW(s->hFmt, CB_ADDSTRING, 0, (LPARAM)L"BMP");
         SendMessageW(s->hFmt, CB_SETCURSEL, (WPARAM)g_tmp.format, 0);
 
-        MkChild(h, L"STATIC", L"文件名前缀：", SS_LEFT, 208, 110, 80, 20, 0);
+        MkChild(h, L"STATIC", L"文件名前缀：", SS_LEFT, 208, 146, 80, 20, 0);
         s->hPrefix = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", g_tmp.prefix.c_str(),
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                     S(288), S(107), S(126), S(24), h,
+                                     S(288), S(143), S(126), S(24), h,
                                      (HMENU)202, g_hInst, nullptr);
         SendMessageW(s->hPrefix, WM_SETFONT, (WPARAM)g_font, TRUE);
 
-        MkChild(h, L"STATIC", L"当前目录：", SS_LEFT, 26, 143, 72, 20, 0);
+        MkChild(h, L"STATIC", L"当前目录：", SS_LEFT, 26, 179, 72, 20, 0);
         s->hPath = MkChild(h, L"STATIC", L"", SS_LEFT | SS_PATHELLIPSIS |
-                          SS_NOPREFIX, 100, 143, 230, 20, 0);
+                          SS_NOPREFIX, 100, 179, 230, 20, 0);
         MkChild(h, L"BUTTON", L"更改…", BS_PUSHBUTTON | WS_TABSTOP,
-                340, 139, 74, 26, 203);
+                340, 175, 74, 26, 203);
 
         s->hAuto = MkChild(h, L"BUTTON", L"开机自启",
-                           BS_AUTOCHECKBOX | WS_TABSTOP, 26, 178, 152, 24, 204);
+                           BS_AUTOCHECKBOX | WS_TABSTOP, 26, 214, 152, 24, 204);
         s->hBalloon = MkChild(h, L"BUTTON", L"截图后气泡提示",
-                              BS_AUTOCHECKBOX | WS_TABSTOP, 182, 178, 120, 24, 205);
+                              BS_AUTOCHECKBOX | WS_TABSTOP, 182, 214, 120, 24, 205);
         s->hBall = MkChild(h, L"BUTTON", L"显示悬浮球",
-                           BS_AUTOCHECKBOX | WS_TABSTOP, 306, 178, 114, 24, 206);
+                           BS_AUTOCHECKBOX | WS_TABSTOP, 306, 214, 114, 24, 206);
 
         // 便携版（U 盘）不做开机自启：注册表项指向的盘符随时会变
         if (IsPortable()) {
@@ -1570,9 +1671,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l)
         SendMessageW(s->hBall,    BM_SETCHECK, g_tmp.ball      ? BST_CHECKED : BST_UNCHECKED, 0);
 
         MkChild(h, L"BUTTON", L"确定", BS_DEFPUSHBUTTON | WS_TABSTOP,
-                238, 244, 88, 30, IDOK);
+                238, 280, 88, 30, IDOK);
         MkChild(h, L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP,
-                334, 244, 88, 30, IDCANCEL);
+                334, 280, 88, 30, IDCANCEL);
 
         RefreshPathLabel(s);
         return 0;
@@ -1584,8 +1685,10 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l)
         int id = LOWORD(w);
         if (id == IDOK) {
             // 读取界面数据并应用
-            g_cfg.mod = g_tmp.mod;
-            g_cfg.vk  = g_tmp.vk;
+            g_cfg.mod  = g_tmp.mod;
+            g_cfg.vk   = g_tmp.vk;
+            g_cfg.mod2 = g_tmp.mod2;
+            g_cfg.vk2  = g_tmp.vk2;
 
             int sel = (int)SendMessageW(st->hFmt, CB_GETCURSEL, 0, 0);
             if (sel >= 0) g_cfg.format = sel;
@@ -1656,7 +1759,7 @@ static void ShowSettings()
 {
     if (g_modal) return;
 
-    int cw = S(440), ch = S(322);   // 高度含标题栏，客户区约 289
+    int cw = S(440), ch = S(358);   // 高度含标题栏，两行热键录制
     int x = (GetSystemMetrics(SM_CXSCREEN) - cw) / 2;
     int y = (GetSystemMetrics(SM_CYSCREEN) - ch) / 2;
 
@@ -1672,19 +1775,26 @@ static void ShowSettings()
     UpdateWindow(h);
     SetForegroundWindow(h);
 
-    RunModal(h, st.hKey);
+    RunModal(h, st.hKey, st.hKey2);
 
     if (st.ok) {
-        // 重新注册热键
+        // 两个热键都重新注册；冲突时提示用户换一个组合键
         UnregisterHotKey(g_hwndMain, ID_HOTKEY_CAPTURE);
+        UnregisterHotKey(g_hwndMain, ID_HOTKEY_SELECT);
         UINT m2 = g_cfg.mod;
+        UINT m3 = g_cfg.mod2;
 #ifdef MOD_NOREPEAT
         m2 |= MOD_NOREPEAT;
+        m3 |= MOD_NOREPEAT;
 #endif
-        if (!RegisterHotKey(g_hwndMain, ID_HOTKEY_CAPTURE, m2, g_cfg.vk)) {
+        std::wstring failed;
+        if (!RegisterHotKey(g_hwndMain, ID_HOTKEY_CAPTURE, m2, g_cfg.vk))
+            failed += HotkeyText(g_cfg.mod, g_cfg.vk) + L"（全屏）\n";
+        if (!RegisterHotKey(g_hwndMain, ID_HOTKEY_SELECT, m3, g_cfg.vk2))
+            failed += HotkeyText(g_cfg.mod2, g_cfg.vk2) + L"（区域）\n";
+        if (!failed.empty()) {
             MessageBoxW(g_hwndMain,
-                        (L"快捷键 " + HotkeyText(g_cfg.mod, g_cfg.vk) +
-                         L" 注册失败，可能已被其他程序占用。\n请重新设置一个组合键。").c_str(),
+                        (L"下列快捷键注册失败，可能已被其他程序占用，请重新设置：\n" + failed).c_str(),
                         APP_NAME, MB_ICONWARNING | MB_OK);
         }
         UpdateTrayTip();
@@ -1725,6 +1835,565 @@ static void DoCapture()
     Balloon(L"截图已保存", name + L"\n（点击打开所在文件夹）");
 }
 
+// ---------------------------------------------------------------------------
+// 区域 / 窗口截图
+//   进入时先冻结一帧全屏画面，再用一个覆盖整个虚拟桌面的置顶窗口做取景框：
+//   拖框 = 区域，单击 = 鼠标下的顶层窗口，W = 窗口吸附提示，F = 整屏，
+//   Enter = 保存当前选区，Esc / 右键 = 取消。
+//   选区坐标一律用「客户区坐标」= 屏幕坐标 - 虚拟桌面原点，正好对应 DIB 像素。
+// ---------------------------------------------------------------------------
+#define IDT_PREVIEW_CLOSE  2
+
+struct SelState {
+    ScreenImage img;
+    HWND  hwnd     = nullptr;
+    RECT  sel      = {};        // 当前选区（客户区坐标）
+    bool  hasSel   = false;
+    bool  dragging = false;
+    POINT anchor   = {};
+    bool  snap     = false;     // W：鼠标移动时自动吸附到窗口
+    bool  done     = false;
+    bool  ok       = false;
+    bool  full     = false;     // F：直接整屏
+    std::wstring note;          // 窗口标题等附加提示
+};
+
+static SelState* g_sel = nullptr;
+
+static POINT SelFromScreen(const SelState* s, POINT p)
+{
+    p.x = ClampInt(p.x - s->img.vx, 0, s->img.w);
+    p.y = ClampInt(p.y - s->img.vy, 0, s->img.h);
+    return p;
+}
+
+static void SelNormalize(RECT* r)
+{
+    if (r->left > r->right) { int t = r->left; r->left = r->right; r->right = t; }
+    if (r->top > r->bottom) { int t = r->top; r->top = r->bottom; r->bottom = t; }
+}
+
+// ---------------------------------------------------------------------------
+// 窗口命中测试：按 Z 序枚举顶层窗口，找第一个包含鼠标点的。
+//   取景框自己覆盖全屏，不能靠 WindowFromPoint（会命中自己），必须枚举排除。
+// ---------------------------------------------------------------------------
+struct WinHit {
+    HWND  self  = nullptr;
+    POINT pt    = {};
+    HWND  found = nullptr;
+    RECT  rc    = {};
+    wchar_t title[128] = {};
+};
+
+static BOOL CALLBACK EnumTopProc(HWND hw, LPARAM lp)
+{
+    WinHit* hit = (WinHit*)lp;
+    if (hw == hit->self || !IsWindowVisible(hw) || IsIconic(hw)) return TRUE;
+    if (GetWindowLongW(hw, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+
+    wchar_t cls[64] = {0};
+    GetClassNameW(hw, cls, 64);
+    if (wcscmp(cls, CLS_SELECT) == 0 || wcscmp(cls, CLS_MAIN) == 0 ||
+        wcscmp(cls, CLS_BALL) == 0 || wcscmp(cls, CLS_PREVIEW) == 0 ||
+        wcscmp(cls, CLS_SETTINGS) == 0 || wcscmp(cls, CLS_NEWFOLDER) == 0)
+        return TRUE;
+
+    // DWMWA_EXTENDED_FRAME_BOUNDS = 9：去掉 Aero 的透明阴影边框。
+    // 动态取函数，不为 dwmapi 增加链接依赖；取不到就退回 GetWindowRect。
+    typedef HRESULT (WINAPI *DwmAttrFn)(HWND, DWORD, PVOID, DWORD);
+    static DwmAttrFn fn = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        HMODULE mod = LoadLibraryW(L"dwmapi.dll");
+        if (mod) fn = (DwmAttrFn)(void*)GetProcAddress(mod, "DwmGetWindowAttribute");
+    }
+    RECT r = {};
+    bool got = false;
+    if (fn) {
+        RECT ext = {};
+        if (SUCCEEDED(fn(hw, 9, &ext, sizeof(ext)))) { r = ext; got = true; }
+    }
+    if (!got && !GetWindowRect(hw, &r)) return TRUE;
+    if (r.right <= r.left || r.bottom <= r.top) return TRUE;
+
+    if (PtInRect(&r, hit->pt)) {
+        hit->found = hw;
+        hit->rc    = r;
+        GetWindowTextW(hw, hit->title, 128);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static bool HitTestWindow(POINT screenPt, RECT* clientRect, std::wstring* title)
+{
+    if (!g_sel) return false;
+    WinHit hit;
+    hit.self = g_sel->hwnd;
+    hit.pt   = screenPt;
+    EnumWindows(EnumTopProc, (LPARAM)&hit);
+    if (!hit.found) return false;
+
+    RECT r = hit.rc;
+    r.left   -= g_sel->img.vx;
+    r.right  -= g_sel->img.vx;
+    r.top    -= g_sel->img.vy;
+    r.bottom -= g_sel->img.vy;
+    r.left   = ClampInt(r.left,   0, g_sel->img.w);
+    r.right  = ClampInt(r.right,  0, g_sel->img.w);
+    r.top    = ClampInt(r.top,    0, g_sel->img.h);
+    r.bottom = ClampInt(r.bottom, 0, g_sel->img.h);
+    if (r.right <= r.left || r.bottom <= r.top) return false;
+
+    *clientRect = r;
+    if (title) {
+        *title = hit.title;
+        if (title->size() > 24) { title->resize(24); *title += L"…"; }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 取景框绘制：双缓冲，冻结画面 + 半透明遮罩；选区内部恢复清晰画面
+// ---------------------------------------------------------------------------
+static int TextWidth(HDC ref, const std::wstring& t)
+{
+    HDC m = CreateCompatibleDC(ref);
+    if (!m) return (int)t.size() * 10;
+    HGDIOBJ old = SelectObject(m, g_font);
+    RECT r = {};
+    DrawTextW(m, t.c_str(), -1, &r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(m, old);
+    DeleteDC(m);
+    return r.right - r.left;
+}
+
+static void SelPaint(HWND h)
+{
+    SelState* s = g_sel;
+    if (!s || !s->img.bits) return;
+
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(h, &ps);
+    HDC mem = CreateCompatibleDC(dc);
+    if (!mem) { EndPaint(h, &ps); return; }
+    HBITMAP mb = CreateCompatibleBitmap(dc, s->img.w, s->img.h);
+    if (!mb) { DeleteDC(mem); EndPaint(h, &ps); return; }
+    HGDIOBJ oldBmp = SelectObject(mem, mb);
+
+    std::wstring hint = L"拖框选区域 · 单击选窗口 · W 窗口吸附 · F 整屏 · Enter 保存 · Esc 取消";
+    if (s->snap) hint += L"   [窗口吸附 开]";
+    int hintW = TextWidth(dc, hint) + S(28);
+    if (hintW > s->img.w - S(16)) hintW = s->img.w - S(16);
+    RECT hintBox = { (s->img.w - hintW) / 2, S(16),
+                     (s->img.w - hintW) / 2 + hintW, S(16) + S(30) };
+
+    std::wstring label;
+    RECT labelBox = {};
+    bool showLabel = false;
+    if (s->hasSel) {
+        RECT r = s->sel;
+        int rw = r.right - r.left, rh = r.bottom - r.top;
+        if (rw > 0 && rh > 0) {
+            showLabel = true;
+            label = ItoS(rw) + L" × " + ItoS(rh);
+            if (!s->note.empty()) label += L"   " + s->note;
+            int tw = TextWidth(dc, label) + S(18);
+            if (tw > s->img.w - S(8)) tw = s->img.w - S(8);
+            int maxLeft = s->img.w - tw - S(4);
+            if (maxLeft < 0) maxLeft = 0;
+            int th = S(24);
+            labelBox.left   = ClampInt(r.left, S(4), maxLeft);
+            labelBox.top    = (r.top >= th + S(10)) ? (r.top - th - S(6)) : (r.top + S(6));
+            labelBox.right  = labelBox.left + tw;
+            labelBox.bottom = labelBox.top + th;
+        }
+    }
+
+    {
+        Graphics g(mem);
+        Bitmap snap(s->img.w, s->img.h, s->img.w * 4,
+                    PixelFormat32bppRGB, s->img.bits);
+        g.DrawImage(&snap, 0, 0, s->img.w, s->img.h);
+
+        SolidBrush dim(Color(115, 0, 0, 0));
+        g.FillRectangle(&dim, 0.0f, 0.0f, (REAL)s->img.w, (REAL)s->img.h);
+
+        if (s->hasSel) {
+            RECT r = s->sel;
+            int rw = r.right - r.left, rh = r.bottom - r.top;
+            if (rw > 0 && rh > 0) {
+                g.DrawImage(&snap,
+                            RectF((REAL)r.left, (REAL)r.top, (REAL)rw, (REAL)rh),
+                            (REAL)r.left, (REAL)r.top, (REAL)rw, (REAL)rh,
+                            UnitPixel);
+                Pen border(Color(255, 0, 170, 255), 2.0f);
+                g.DrawRectangle(&border, (REAL)r.left, (REAL)r.top,
+                                (REAL)rw, (REAL)rh);
+                SolidBrush handle(Color(255, 255, 255, 255));
+                REAL hs = (REAL)S(6);
+                g.FillRectangle(&handle, r.left - hs / 2, r.top - hs / 2, hs, hs);
+                g.FillRectangle(&handle, r.right - hs / 2, r.top - hs / 2, hs, hs);
+                g.FillRectangle(&handle, r.left - hs / 2, r.bottom - hs / 2, hs, hs);
+                g.FillRectangle(&handle, r.right - hs / 2, r.bottom - hs / 2, hs, hs);
+            }
+        }
+
+        SolidBrush panel(Color(210, 20, 20, 20));
+        Pen edge(Color(255, 235, 235, 235), 1.0f);
+        if (showLabel)
+            g.FillRectangle(&panel, (REAL)labelBox.left, (REAL)labelBox.top,
+                            (REAL)(labelBox.right - labelBox.left),
+                            (REAL)(labelBox.bottom - labelBox.top));
+        g.FillRectangle(&panel, (REAL)hintBox.left, (REAL)hintBox.top,
+                        (REAL)(hintBox.right - hintBox.left),
+                        (REAL)(hintBox.bottom - hintBox.top));
+        g.DrawRectangle(&edge, (REAL)hintBox.left, (REAL)hintBox.top,
+                        (REAL)(hintBox.right - hintBox.left),
+                        (REAL)(hintBox.bottom - hintBox.top));
+    }
+
+    // GDI 文字要等 Graphics 析构之后再画，避免两套引擎同时操作同一个 HDC
+    SetBkMode(mem, TRANSPARENT);
+    SetTextColor(mem, RGB(255, 255, 255));
+    HGDIOBJ oldFont = SelectObject(mem, g_font);
+    if (showLabel)
+        DrawTextW(mem, label.c_str(), -1, &labelBox,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(mem, hint.c_str(), -1, &hintBox,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(mem, oldFont);
+
+    int px = ps.rcPaint.left, py = ps.rcPaint.top;
+    int pw = ps.rcPaint.right - px, ph = ps.rcPaint.bottom - py;
+    if (pw > 0 && ph > 0) BitBlt(dc, px, py, pw, ph, mem, px, py, SRCCOPY);
+
+    SelectObject(mem, oldBmp);
+    DeleteObject(mb);
+    DeleteDC(mem);
+    EndPaint(h, &ps);
+}
+
+static void SelFinish(SelState* s, bool ok)
+{
+    if (s->done) return;
+    s->ok   = ok;
+    s->done = true;
+    // 唤醒 DoSelectCapture 里阻塞的 GetMessage
+    PostMessageW(g_hwndMain, WM_NULL, 0, 0);
+}
+
+static LRESULT CALLBACK SelectProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    SelState* s = g_sel;
+    if (!s) return DefWindowProcW(h, m, w, l);
+
+    switch (m) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+        SelPaint(h);
+        return 0;
+
+    case WM_SETCURSOR:
+        SetCursor(LoadCursor(nullptr, IDC_CROSS));
+        return TRUE;
+
+    case WM_LBUTTONDOWN: {
+        POINT p;
+        GetCursorPos(&p);
+        s->anchor   = SelFromScreen(s, p);
+        s->dragging = true;
+        s->hasSel   = false;
+        s->note.clear();
+        SetCapture(h);
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        POINT screen;
+        GetCursorPos(&screen);
+        POINT p = SelFromScreen(s, screen);
+        if (s->dragging) {
+            RECT r = { s->anchor.x, s->anchor.y, p.x, p.y };
+            SelNormalize(&r);
+            s->sel    = r;
+            s->hasSel = true;
+            s->note.clear();
+            InvalidateRect(h, nullptr, FALSE);
+        } else if (s->snap) {
+            RECT wr;
+            std::wstring title;
+            if (HitTestWindow(screen, &wr, &title)) {
+                s->sel = wr; s->hasSel = true; s->note = title;
+            } else {
+                s->hasSel = false; s->note.clear();
+            }
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        if (!s->dragging) return 0;
+        ReleaseCapture();
+        s->dragging = false;
+        int rw = s->sel.right - s->sel.left;
+        int rh = s->sel.bottom - s->sel.top;
+        if (s->hasSel && rw >= 4 && rh >= 4) {
+            SelFinish(s, true);                 // 拖框 = 区域
+        } else {
+            POINT screen;                       // 单击 = 鼠标下的窗口
+            GetCursorPos(&screen);
+            RECT wr;
+            std::wstring title;
+            if (HitTestWindow(screen, &wr, &title)) {
+                s->sel = wr; s->hasSel = true; s->note = title;
+                SelFinish(s, true);
+            } else {
+                s->hasSel = false;
+                InvalidateRect(h, nullptr, FALSE);
+            }
+        }
+        return 0;
+    }
+
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+        SelFinish(s, false);
+        return 0;
+
+    case WM_KEYDOWN:
+        switch (w) {
+        case VK_ESCAPE:
+            SelFinish(s, false);
+            return 0;
+        case VK_RETURN:
+            if (s->hasSel) SelFinish(s, true);
+            else { s->full = true; SelFinish(s, true); }
+            return 0;
+        case 'F':
+            s->full = true;
+            SelFinish(s, true);
+            return 0;
+        case 'W':
+            s->snap = !s->snap;
+            if (!s->snap) { s->hasSel = false; s->note.clear(); }
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        default:
+            break;
+        }
+        return 0;
+
+    case WM_CLOSE:
+        SelFinish(s, false);
+        return 0;      // 不交给 DefWindowProc，窗口统一由 DoSelectCapture 销毁
+
+    default:
+        break;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+// ---------------------------------------------------------------------------
+// 保存后的缩略图回执：右下角浮 3 秒，单击打开所在文件夹并选中文件
+// ---------------------------------------------------------------------------
+struct PrevState {
+    std::wstring path;
+    std::wstring label;
+};
+static PrevState g_prev;
+static HWND      g_hwndPreview = nullptr;
+
+static LRESULT CALLBACK PreviewProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP mb = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+        HGDIOBJ oldBmp = SelectObject(mem, mb);
+        {
+            Graphics g(mem);
+            SolidBrush bg(Color(255, 32, 32, 32));
+            g.FillRectangle(&bg, 0.0f, 0.0f, (REAL)rc.right, (REAL)rc.bottom);
+
+            Image* img = Image::FromFile(g_prev.path.c_str());
+            if (img && img->GetLastStatus() == Ok &&
+                img->GetWidth() > 0 && img->GetHeight() > 0) {
+                REAL boxW = (REAL)(rc.right - S(20));
+                REAL boxH = (REAL)(rc.bottom - S(46));
+                REAL sc = boxW / (REAL)img->GetWidth();
+                REAL sc2 = boxH / (REAL)img->GetHeight();
+                if (sc2 < sc) sc = sc2;
+                if (sc > 1.0f) sc = 1.0f;
+                REAL dw = (REAL)img->GetWidth() * sc;
+                REAL dh = (REAL)img->GetHeight() * sc;
+                REAL dx = ((REAL)rc.right - dw) / 2.0f;
+                REAL dy = (REAL)S(10) + (boxH - dh) / 2.0f;
+                g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+                g.DrawImage(img, RectF(dx, dy, dw, dh));
+            }
+            delete img;
+
+            Pen edge(Color(255, 100, 100, 100), 1.0f);
+            g.DrawRectangle(&edge, 0.0f, 0.0f,
+                            (REAL)rc.right - 1, (REAL)rc.bottom - 1);
+        }
+        SetBkMode(mem, TRANSPARENT);
+        SetTextColor(mem, RGB(230, 230, 230));
+        HGDIOBJ oldFont = SelectObject(mem, g_font);
+        RECT tr = { S(8), rc.bottom - S(32), rc.right - S(8), rc.bottom - S(8) };
+        DrawTextW(mem, g_prev.label.c_str(), -1, &tr,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        SelectObject(mem, oldFont);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, oldBmp);
+        DeleteObject(mb);
+        DeleteDC(mem);
+        EndPaint(h, &ps);
+        return 0;
+    }
+
+    case WM_TIMER:
+        DestroyWindow(h);
+        return 0;
+
+    case WM_LBUTTONUP:
+        RevealFile(g_prev.path);
+        DestroyWindow(h);
+        return 0;
+
+    case WM_RBUTTONUP:
+        DestroyWindow(h);
+        return 0;
+
+    case WM_DESTROY:
+        KillTimer(h, IDT_PREVIEW_CLOSE);
+        return 0;
+
+    default:
+        break;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void ShowPreview(const std::wstring& path, int iw, int ih)
+{
+    if (g_hwndPreview && IsWindow(g_hwndPreview)) DestroyWindow(g_hwndPreview);
+
+    g_prev.path = path;
+    std::wstring name = path;
+    size_t k = name.find_last_of(L'\\');
+    if (k != std::wstring::npos) name = name.substr(k + 1);
+    g_prev.label = name + L"   " + ItoS(iw) + L" × " + ItoS(ih);
+
+    int w = S(268), hgt = S(190);
+    int x = GetSystemMetrics(SM_CXSCREEN) - w - S(18);
+    int y = GetSystemMetrics(SM_CYSCREEN) - hgt - S(18);
+    HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                             CLS_PREVIEW, L"", WS_POPUP | WS_VISIBLE,
+                             x, y, w, hgt, g_hwndMain, nullptr, g_hInst, nullptr);
+    if (!h) { g_hwndPreview = nullptr; return; }
+    g_hwndPreview = h;
+    SetTimer(h, IDT_PREVIEW_CLOSE, 3200, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// 进入区域截图模式：冻结画面 → 取景框 → 按选区裁图保存
+// ---------------------------------------------------------------------------
+static void DoSelectCapture()
+{
+    if (g_modal || g_sel) return;
+
+    bool ballShown = (g_hwndBall && IsWindowVisible(g_hwndBall));
+    if (ballShown) {
+        ShowWindow(g_hwndBall, SW_HIDE);
+        Sleep(70);
+    }
+
+    SelState st;
+    std::wstring err;
+    if (!GrabScreen(&st.img, &err)) {
+        if (ballShown && g_hwndBall) {
+            ShowWindow(g_hwndBall, SW_SHOWNA);
+            BallEnsureTopmost();
+        }
+        Balloon(L"截图失败", err, NIIF_ERROR);
+        return;
+    }
+
+    g_sel   = &st;
+    g_modal = true;
+
+    HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, CLS_SELECT, L"",
+                             WS_POPUP | WS_VISIBLE,
+                             st.img.vx, st.img.vy, st.img.w, st.img.h,
+                             g_hwndMain, nullptr, g_hInst, nullptr);
+    if (h) {
+        st.hwnd = h;
+        SetForegroundWindow(h);
+        SetFocus(h);
+        InvalidateRect(h, nullptr, FALSE);
+
+        MSG msg;
+        while (!st.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            if (msg.message == WM_QUIT) {
+                PostQuitMessage((int)msg.wParam);
+                st.done = true;
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (IsWindow(h)) DestroyWindow(h);
+    } else {
+        err = L"无法创建选区窗口。";
+        Balloon(L"截图失败", err, NIIF_ERROR);
+    }
+
+    g_sel   = nullptr;
+    g_modal = false;
+
+    if (ballShown && g_hwndBall) {
+        ShowWindow(g_hwndBall, SW_SHOWNA);
+        BallEnsureTopmost();
+    }
+
+    if (!st.ok) { st.img.Free(); return; }
+
+    RECT area = st.full ? RECT{0, 0, st.img.w, st.img.h} : st.sel;
+    int aw = area.right - area.left;
+    int ah = area.bottom - area.top;
+
+    std::wstring path;
+    bool ok = SaveDibRegion(st.img, area, &path, &err);
+    st.img.Free();
+    if (!ok) {
+        Balloon(L"截图失败", err, NIIF_ERROR);
+        return;
+    }
+
+    g_lastSaved = path;
+    std::wstring name = path;
+    size_t k = name.find_last_of(L'\\');
+    if (k != std::wstring::npos) name = name.substr(k + 1);
+    Balloon(L"截图已保存",
+            name + L"\n" + ItoS(aw) + L" × " + ItoS(ah) +
+            L"\n（点击打开所在文件夹）");
+    ShowPreview(path, aw, ah);
+}
+
 static void CreateNewFolder()
 {
     if (!EnsureDir(g_cfg.baseDir)) {
@@ -1763,8 +2432,10 @@ static void ShowAppMenu(POINT pt)
 
     HMENU m = CreatePopupMenu();
 
-    std::wstring cap = L"截图\t" + HotkeyText(g_cfg.mod, g_cfg.vk);
+    std::wstring cap = L"全屏截图\t" + HotkeyText(g_cfg.mod, g_cfg.vk);
     AppendMenuW(m, MF_STRING, IDM_CAPTURE, cap.c_str());
+    std::wstring cap2 = L"区域 / 窗口截图…\t" + HotkeyText(g_cfg.mod2, g_cfg.vk2);
+    AppendMenuW(m, MF_STRING, IDM_SELECT, cap2.c_str());
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
 
     HMENU sub = CreatePopupMenu();
@@ -1802,7 +2473,8 @@ static void ShowAppMenu(POINT pt)
     // 把焦点还给原来的前台窗口（例如正在全屏的应用），避免它被最小化。
     // 但如果接下来要弹自己的对话框，就不能先还——否则对话框会被全屏应用盖住。
     bool opensUI = (cmd == IDM_SETTINGS || cmd == IDM_NEW_FOLDER ||
-                    cmd == IDM_CHOOSE_BASE || cmd == IDM_ABOUT);
+                    cmd == IDM_CHOOSE_BASE || cmd == IDM_ABOUT ||
+                    cmd == IDM_SELECT);
     if (!opensUI && prevFg && prevFg != g_hwndMain && prevFg != g_hwndBall &&
         IsWindow(prevFg))
         SetForegroundWindow(prevFg);
@@ -1819,6 +2491,9 @@ static void ShowAppMenu(POINT pt)
     switch (cmd) {
     case IDM_CAPTURE:
         DoCapture();
+        break;
+    case IDM_SELECT:
+        DoSelectCapture();
         break;
     case IDM_FOLDER_BASE:
         g_cfg.subDir.clear();
@@ -1861,10 +2536,11 @@ static void ShowAppMenu(POINT pt)
             : std::wstring(L"安装模式");
         std::wstring msg = std::wstring(L"QuickShot ") + APP_VERSION +
                            L"\n" + mode +
-                           L"\n\n全局快捷键：" + HotkeyText(g_cfg.mod, g_cfg.vk) +
+                           L"\n\n全屏截图：" + HotkeyText(g_cfg.mod, g_cfg.vk) +
+                           L"\n区域 / 窗口截图：" + HotkeyText(g_cfg.mod2, g_cfg.vk2) +
                            L"\n保存位置：" + SaveDir() +
                            L"\n配置文件：" + ConfigPath() +
-                           L"\n\n左键单击托盘图标 = 立即截图，右键 = 菜单。";
+                           L"\n\n托盘左键 = 全屏截图，右键 = 菜单；\n悬浮球左键 = 全屏，Shift + 左键 = 区域。";
         MessageBoxW(g_hwndMain, msg.c_str(), APP_NAME, MB_ICONINFORMATION | MB_OK);
         break;
     }
@@ -1887,13 +2563,15 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
 
     case WM_HOTKEY:
+        if (g_modal) return 0;     // 取景框 / 对话框期间不叠加截图
         if (w == ID_HOTKEY_CAPTURE) DoCapture();
+        else if (w == ID_HOTKEY_SELECT) DoSelectCapture();
         return 0;
 
     case WM_TRAY_MSG:
         switch (LOWORD(l)) {
         case WM_LBUTTONUP:
-            DoCapture();
+            if (!g_modal) DoCapture();
             break;
         case WM_RBUTTONUP:
         case WM_CONTEXTMENU: {
@@ -1995,6 +2673,16 @@ static bool RegisterClasses()
     wc.hCursor       = LoadCursor(nullptr, IDC_HAND);
     if (!RegisterClassExW(&wc)) return false;
 
+    wc.lpfnWndProc   = SelectProc;
+    wc.lpszClassName = CLS_SELECT;
+    wc.hCursor       = LoadCursor(nullptr, IDC_CROSS);
+    if (!RegisterClassExW(&wc)) return false;
+
+    wc.lpfnWndProc   = PreviewProc;
+    wc.lpszClassName = CLS_PREVIEW;
+    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+    if (!RegisterClassExW(&wc)) return false;
+
     return true;
 }
 
@@ -2051,15 +2739,21 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     // 若配置了开机自启，刷新注册表项（exe 可能被移动/改名过）
     if (g_cfg.autostart) ApplyAutostart(true);
 
-    // 注册全局热键
-    UINT regMod = g_cfg.mod;
+    // 注册两个全局热键；冲突时逐个提示，不阻断程序驻留
+    UINT regMod  = g_cfg.mod;
+    UINT regMod2 = g_cfg.mod2;
 #ifdef MOD_NOREPEAT
-    regMod |= MOD_NOREPEAT;
+    regMod  |= MOD_NOREPEAT;
+    regMod2 |= MOD_NOREPEAT;
 #endif
-    if (!RegisterHotKey(g_hwndMain, ID_HOTKEY_CAPTURE, regMod, g_cfg.vk)) {
-        std::wstring msg = L"快捷键 " + HotkeyText(g_cfg.mod, g_cfg.vk) +
-                           L" 注册失败，可能被其他程序占用。\n\n"
-                           L"程序仍会驻留在托盘，右键图标选择「设置…」可更换快捷键。";
+    std::wstring failed;
+    if (!RegisterHotKey(g_hwndMain, ID_HOTKEY_CAPTURE, regMod, g_cfg.vk))
+        failed += HotkeyText(g_cfg.mod, g_cfg.vk) + L"（全屏）\n";
+    if (!RegisterHotKey(g_hwndMain, ID_HOTKEY_SELECT, regMod2, g_cfg.vk2))
+        failed += HotkeyText(g_cfg.mod2, g_cfg.vk2) + L"（区域）\n";
+    if (!failed.empty()) {
+        std::wstring msg = L"下列快捷键注册失败，可能被其他程序占用：\n" + failed +
+                           L"\n程序仍会驻留在托盘，右键图标选择「设置…」可更换快捷键。";
         MessageBoxW(nullptr, msg.c_str(), APP_NAME, MB_ICONWARNING | MB_OK);
     }
 
@@ -2072,7 +2766,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
         ForegroundEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
 
     std::wstring hello = std::wstring(L"按 ") + HotkeyText(g_cfg.mod, g_cfg.vk) +
-                         L" 截图，或点击桌面悬浮球";
+                         L" 全屏截图\n按 " + HotkeyText(g_cfg.mod2, g_cfg.vk2) +
+                         L" 区域 / 窗口截图，或点击悬浮球";
     if (IsPortable())
         hello += L"\n截图自动存到程序目录下的 Screenshots";
     Balloon(L"QuickShot 已启动", hello);
