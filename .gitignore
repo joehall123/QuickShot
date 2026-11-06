@@ -9,6 +9,10 @@
 *.lib
 *.map
 
+# 交叉编译 / CI 的本地产物
+/build/
+/out/
+
 # 运行时生成
 quickshot.ini
 Screenshots/

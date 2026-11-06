@@ -8,7 +8,7 @@
 
 ## 下载即用
 
-到 [Releases](https://github.com/joehall123/QuickShot/releases/latest) 下载 `QuickShot-1.3-portable.zip`，
+到 [Releases](https://github.com/joehall123/QuickShot/releases/latest) 下载 `QuickShot-1.4-portable.zip`，
 解压后双击 `QuickShot.exe` 即可，无需安装、无需编译。绿色便携，可直接放在 U 盘里跨机器使用
 （配置与截图都留在 exe 同目录，换盘符不受影响）。
 
@@ -21,7 +21,8 @@
 | 双全局快捷键 | 默认 `Ctrl+Alt+A` = 全屏截图、`Ctrl+Alt+S` = 区域 / 窗口截图；两个都能在设置里改成任意组合（如 `F9`、`Ctrl+Shift+S`） |
 | 全屏截图 | 一次抓取整个虚拟桌面，多显示器也能一张图全包含；`CAPTUREBLT` 保证分层窗口也能截到 |
 | 区域 / 窗口截图 | 冻结一帧画面后进入取景框：**拖框截区域、单击截鼠标下的窗口**，`W` 窗口吸附、`F` 整屏、`Enter` 保存、`Esc` 取消；选区实时显示尺寸与窗口标题，保存后右下角浮出缩略图 |
-| 自动保存 | 默认存到 `我的图片\Screenshots`，文件名 `Screenshot_20261103_212233.png` |
+| 自动保存 | 默认存到 **exe 同目录下的 `验证截图` 文件夹**（首次启动自动创建），文件名 `Screenshot_20261103_212233.png` |
+| 截图回执 | 每张图存好后，托盘图标和悬浮球一起变绿约 0.5 秒再恢复 —— 连拍时不用去点气泡也能确认「这张存下来了」 |
 | 文件夹管理 | 右键菜单一级就有「**新建文件夹…（自己命名）**」，在程序自己的对话框里输入名称（实时预览完整路径、重名会提示、回车确认），建好立即切换为当前目录，之后所有截图都存进去 |
 | 多格式 | PNG（默认，无损）/ JPEG（质量 92）/ BMP |
 | 前缀自定义 | 文件名前缀可改，例如改成 `温度报警` |
@@ -43,7 +44,7 @@ U盘版\                      ← 整个拷到 U 盘
 ├─ QuickShot_x86.exe        32 位主程序（老机器用）
 ├─ 使用说明.txt             给现场同事看的纸质版说明
 ├─ quickshot.ini            首次运行自动生成（配置）
-└─ Screenshots\             首次运行自动创建（截图都在这）
+└─ 验证截图\                首次运行自动创建（截图都在这）
 ```
 
 ### 便携模式下程序会自动做这些事
@@ -53,14 +54,14 @@ U盘版\                      ← 整个拷到 U 盘
 | 行为 | 便携模式下的表现 |
 |---|---|
 | 配置文件 | 放在 exe 同目录 `quickshot.ini`，**不写 `%APPDATA%`** |
-| 默认保存目录 | 自动变成 `exe 同目录\Screenshots`，不会跑到「我的图片」 |
-| 路径记录方式 | 存**相对路径**（`.\Screenshots`）而不是绝对路径 —— 所以盘符从 `E:` 变成 `F:`、
+| 默认保存目录 | 自动变成 `exe 同目录\验证截图`，不会跑到「我的图片」 |
+| 路径记录方式 | 存**相对路径**（`.\验证截图`）而不是绝对路径 —— 所以盘符从 `E:` 变成 `F:`、
   甚至整个文件夹搬走，配置依然有效 |
 | 开机自启 | **自动禁用**（注册表项的盘符会失效），设置里该项显示为「开机自启（U盘不适用）」并置灰 |
 | 注册表 | 不写（除非装成固定位置且手动勾选开机自启） |
 
 想改回「安装模式」：把 exe 放到一个不可写的目录（如 `C:\Program Files\QuickShot`），
-配置就会自动落到 `%APPDATA%\QuickShot\`，截图回到「我的图片」。
+配置就会自动落到 `%APPDATA%\QuickShot\`，截图改存「我的图片\验证截图」（程序目录不可写时不能往自己旁边写）。
 
 ### 32 位还是 64 位
 
@@ -70,7 +71,7 @@ U盘版\                      ← 整个拷到 U 盘
 | `QuickShot_x86.exe` | 32 位系统 / 老工控机 |
 
 拿不准就先双击 64 位那个，报「不是有效的 Win32 应用程序」就换 `QuickShot_x86.exe`。
-两个 exe 放在同一目录时共用同一份 `quickshot.ini` 和 `Screenshots`，不会各存一份。
+两个 exe 放在同一目录时共用同一份 `quickshot.ini` 和 `验证截图`，不会各存一份。
 
 ### Win7 的额外说明
 
@@ -194,6 +195,32 @@ g++ -O2 -municode -mwindows -DUNICODE -D_UNICODE -static -static-libgcc -static-
 > 注意：MinGW-w64 有 **ucrt** 和 **msvcrt** 两种运行时。要兼容原版 Win7，请用 `msvcrt` 版工具链；
 > `ucrt` 版生成的 exe 在 Win7 上需要已安装 KB2999226（Universal C Runtime）。
 
+### 方式 C：在 macOS / Linux 上交叉编译（没有 Windows 环境时用）
+
+```sh
+brew install mingw-w64      # Linux: sudo apt-get install mingw-w64
+./build_crosscompile.sh     # 产出 build/QuickShot.exe 与 build/QuickShot_x86.exe
+```
+
+脚本用的编译参数和方式 B 一致（另加 `-Wall -Wextra`），一次同时出 64 位和 32 位。
+资源脚本用 `--codepage=65001` 读取，配合 `app.rc` 里的 `#pragma code_page(65001)`，
+中文版本信息不会花。
+
+> **交叉编译只能验证「编得过」，不能验证「跑得对」。** 本机没有 Windows，
+> 热键、托盘、悬浮球、实际取图这些必须拿到 Windows 机器上实测。
+
+### CI：push 即自动编译
+
+`.github/workflows/build-windows.yml` 在 ubuntu runner 上做和方式 C 相同的两步编译：
+
+| 触发 | 结果 |
+|---|---|
+| push 到 `main` / PR | Actions 产物里下载 `QuickShot.exe`、`QuickShot_x86.exe`、便携 zip |
+| 打 `v*` 标签 | 额外把 `QuickShot-<版本>-portable.zip` 挂到该版本的 Release |
+
+编译加了 `-Wall -Wextra`，所以「零警告」这条在 CI 日志里是可查证的，不靠口头声明。
+CI **不会**覆写仓库里的 `U盘版/*.exe` —— 那两个二进制是确认实测通过后才人工提交的。
+
 ### 本目录里现成的 `QuickShot.exe`
 
 这是我在 macOS 上用 LLVM-MinGW（ucrt 运行时）交叉编译出来的**验证版**，已经通过零警告编译，
@@ -213,6 +240,8 @@ g++ -O2 -municode -mwindows -DUNICODE -D_UNICODE -static -static-libgcc -static-
 | `app.rc` / `app.manifest` | 资源：应用清单（Win7+ 声明、DPI 感知、主题控件）+ 版本信息 |
 | `build_msvc.bat` | MSVC 构建脚本 |
 | `build_mingw.bat` | MinGW-w64 构建脚本 |
+| `build_crosscompile.sh` | macOS / Linux 交叉编译脚本（同时出 64 位和 32 位） |
+| `.github/workflows/build-windows.yml` | CI：push 自动编译并产出可下载的 exe / 便携包 |
 | `QuickShot_x86.exe` | 32 位版本（同一份源码编译） |
 | `U盘版/` | 便携包：两个 exe + 使用说明，整个文件夹拷到 U 盘即可 |
 | `quickshot.ini` | 运行时自动生成的配置（首次运行后出现） |
@@ -227,14 +256,18 @@ vk=65            ; 主键虚拟键码，65='A'
 mod2=3           ; 区域截图热键（同上）
 vk2=83           ; 83='S'
 [save]
-baseDir=C:\Users\xxx\Pictures\Screenshots
-subDir=现场A
+baseDir=.\验证截图    ; 便携模式下存相对路径；安装模式则是绝对路径
+subDir=现场A          ; 相对 baseDir 的子文件夹，空 = 直接存 baseDir
 format=0         ; 0=PNG 1=JPEG 2=BMP
 prefix=Screenshot
 [ui]
 balloon=1
 autostart=0
 ```
+
+> `baseDir` 为空时才回落到默认值（exe 同目录的 `验证截图`）。
+> 也就是说：**老 ini 里已经写过的目录不会被新版本改写**，升级后仍存到原来位置，
+> 想要新默认目录就把 `[save]` 段的 `baseDir` 那行删掉再启动。
 
 ---
 
@@ -274,6 +307,14 @@ autostart=0
    取不到就退回 `GetWindowRect`）。
 14. **缩略图回执**：保存后右下角 `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` 浮层显示刚存的图片，
    3.2 秒自动消失，单击打开所在文件夹；不抢前台焦点，也不进任务栏。
+15. **图标变色回执**：正常色与变色两套图标（32/16 各一）在启动时一次性画好，截图后只切换
+    `g_nid.hIcon` 并 `NIM_MODIFY`，不在截图路径上现画图，避免拖慢存盘；悬浮球共用同一个
+    `g_flashing` 标志，由 `BallUpdate()` 重新 `UpdateLayeredWindow`。
+    这里有个 Shell 的坑：**气泡显示期间对图标做 `NIM_MODIFY` 会把气泡直接关掉**，
+    于是「点气泡打开所在文件夹」就废了。所以复位动作要等气泡自己消失 ——
+    `Balloon()` 置 `g_balloonUp`，`IDT_FLASH` 到点时若气泡还在就再等 200ms，
+    并在 `NIN_BALLOONTIMEOUT` / `NIN_BALLOONHIDE` / `NIN_BALLOONUSERCLICK` 里补做复位。
+    顺序也因此是先变色、后弹气泡；反过来绿色那一下会被气泡的 `NIM_MODIFY` 冲掉。
 
 ---
 

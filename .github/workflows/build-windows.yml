@@ -1,0 +1,83 @@
+name: build-windows
+
+# 在 Linux runner 上用 MinGW-w64 交叉编译出 64/32 位 exe，
+# 这样这台 Mac 上改完代码 push 就能看到能不能编译通过、并拿到可直接运行的产物。
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FLAGS: "-O2 -municode -mwindows -DUNICODE -D_UNICODE -Wall -Wextra"
+  STATIC: "-static -static-libgcc -static-libstdc++"
+  LIBS: "-lgdiplus -lshell32 -lshlwapi -lole32 -ladvapi32 -luser32 -lgdi32 -lcomdlg32"
+
+jobs:
+  cross-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 MinGW-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64
+
+      - name: 编译 64 位
+        run: |
+          mkdir -p out
+          x86_64-w64-mingw32-windres --codepage=65001 app.rc -o out/app_res_x64.o
+          x86_64-w64-mingw32-g++ $FLAGS $STATIC QuickShot.cpp out/app_res_x64.o \
+            -o out/QuickShot.exe $LIBS
+
+      - name: 编译 32 位
+        run: |
+          i686-w64-mingw32-windres --codepage=65001 app.rc -o out/app_res_x86.o
+          i686-w64-mingw32-g++ $FLAGS $STATIC QuickShot.cpp out/app_res_x86.o \
+            -o out/QuickShot_x86.exe $LIBS
+
+      - name: 核对产物
+        run: |
+          file out/QuickShot.exe out/QuickShot_x86.exe
+          ls -lh out/
+
+      # 便携包沿用现有 release 的约定：zip 内平铺（无子目录）、附件名带版本号且纯 ASCII。
+      # 不覆写仓库里的 U盘版/ —— 那两个 exe 是要人工确认后提交进 git 的。
+      - name: 组装便携包
+        run: |
+          VER=$(sed -n 's/.*APP_VERSION *= *L"\([^"]*\)".*/\1/p' QuickShot.cpp)
+          echo "version=$VER" >> "$GITHUB_ENV"
+          mkdir -p out/pkg
+          cp out/QuickShot.exe out/QuickShot_x86.exe "U盘版/使用说明.txt" out/pkg/
+          cd out/pkg
+          zip -r "../../QuickShot-${VER}-portable.zip" QuickShot.exe QuickShot_x86.exe 使用说明.txt
+          cd ../..
+          ls -lh "QuickShot-${VER}-portable.zip"
+          unzip -l "QuickShot-${VER}-portable.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QuickShot-windows-${{ env.version }}
+          path: |
+            out/QuickShot.exe
+            out/QuickShot_x86.exe
+            QuickShot-*-portable.zip
+          if-no-files-found: error
+
+      # 只有打 tag 才发 Release，日常 push 只出 artifact，避免攒一堆半成品版本
+      - name: 发布到 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ZIP="QuickShot-${version}-portable.zip"
+          gh release create "$GITHUB_REF_NAME" "$ZIP" \
+            --title "QuickShot ${version}" \
+            --notes "由 GitHub Actions 用 MinGW-w64 交叉编译（ucrt 运行时）。Win10/11 直接可用；Win7 若提示缺少 api-ms-win-crt-*.dll，请改用 build_msvc.bat 的 /MT 静态链接版本。" \
+            || gh release upload "$GITHUB_REF_NAME" "$ZIP" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

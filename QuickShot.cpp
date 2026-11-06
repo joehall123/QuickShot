@@ -4,10 +4,11 @@
 //  功能：
 //    1. 托盘常驻，自定义全局快捷键（默认 Ctrl+Alt+A）
 //    2. 一键截取全屏（支持多显示器，含分层窗口）
-//    3. 自动保存到「图片\Screenshots」，可自建并命名子文件夹
+//    3. 自动保存到 exe 同目录下的「验证截图」，可自建并命名子文件夹
 //    4. 支持 PNG / JPEG / BMP，文件名前缀可自定义
 //    5. 可选开机自启、截图后气泡提示
 //    6. 区域 / 窗口截图：拖框选区域、单击选窗口、W 窗口吸附、F 整屏
+//    7. 每次截图后托盘图标与悬浮球短暂变色，作为「已存盘」的视觉回执
 //
 //  构建：见 build_msvc.bat / build_mingw.bat
 // ============================================================================
@@ -48,7 +49,10 @@ using namespace Gdiplus;
 // 常量与全局状态
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME    = L"QuickShot";
-static const wchar_t* APP_VERSION = L"1.3";
+static const wchar_t* APP_VERSION = L"1.4";
+
+// 默认截图子目录名：程序启动时建在 exe 同目录下，截图默认都落在这里
+static const wchar_t* SHOT_FOLDER = L"验证截图";
 
 #define WM_TRAY_MSG        (WM_APP + 10)
 #define WM_KB_CHANGED      (WM_APP + 11)
@@ -56,6 +60,9 @@ static const wchar_t* APP_VERSION = L"1.3";
 #define ID_TRAY_ICON       1
 #define ID_HOTKEY_CAPTURE  101
 #define ID_HOTKEY_SELECT   102
+#define IDT_FLASH          5      // 截图后图标变色的恢复定时器（挂在主隐藏窗口）
+#define FLASH_ON_MS        500    // 变色持续多久
+#define FLASH_HOLD_MAX_MS  4000   // 气泡不肯关闭时，最多再拖这么久就必须复位（兜底）
 
 // 菜单命令
 enum {
@@ -100,6 +107,11 @@ static HINSTANCE g_hInst      = nullptr;
 static HWND      g_hwndMain   = nullptr;
 static HICON     g_hiconBig   = nullptr;
 static HICON     g_hiconSmall = nullptr;
+static HICON     g_hiconBigFlash   = nullptr;   // 截图反馈用的变色图标
+static HICON     g_hiconSmallFlash = nullptr;
+static bool      g_flashing   = false;          // true = 正处于变色回执期间
+static bool      g_balloonUp  = false;          // 气泡仍在显示（此时改图标会被 Shell 关掉气泡）
+static ULONGLONG g_flashStart = 0;              // 本次变色的起始时刻，用于兜底复位
 static UINT      g_msgTaskbarCreated = 0;
 static HFONT     g_font       = nullptr;
 static HFONT     g_fontBold   = nullptr;
@@ -121,6 +133,8 @@ static void ShowSettings();
 static void BallShow(bool show);
 static void BallClampToScreen();
 static void BallEnsureTopmost();
+static void BallUpdate();
+static void FlashCaptureFeedback();   // 截图成功后的图标变色（定义在托盘一节）
 
 // ---------------------------------------------------------------------------
 // 小工具
@@ -222,13 +236,17 @@ static std::wstring StoredToPath(const std::wstring& stored)
 
 static std::wstring DefaultPicturesDir()
 {
-    // 便携模式：截图直接存到 U 盘里的 Screenshots
-    if (IsPortable()) return ExeDir() + L"\\Screenshots";
+    // 默认直接存到 exe 同目录下的「验证截图」：现场核对时图就在软件旁边，
+    // 不用去翻系统「图片」文件夹。便携模式下这条路径会被 PathToStored 改写成
+    // 相对形式（".\验证截图"），所以换盘符、整个文件夹搬走都依然有效。
+    if (IsPortable()) return ExeDir() + L"\\" + SHOT_FOLDER;
 
+    // 程序目录不可写（例如装进 Program Files）时退回「我的图片」，
+    // 否则截图会因为落不了盘而失败
     wchar_t p[MAX_PATH] = {0};
     if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_MYPICTURES, nullptr, 0, p)))
-        return std::wstring(p) + L"\\Screenshots";
-    return ExeDir() + L"\\Screenshots";
+        return std::wstring(p) + L"\\" + SHOT_FOLDER;
+    return ExeDir() + L"\\" + SHOT_FOLDER;
 }
 
 static bool EnsureDir(const std::wstring& dir)
@@ -369,25 +387,39 @@ struct Canvas {
     }
 };
 
-static HICON MakeAppIcon(int size)
+// 图标配色：平时蓝色，截图成功的那一瞬间换成绿色，作为「已存盘」的即时信号
+struct IconPalette {
+    BYTE bodyR,  bodyG,  bodyB;
+    BYTE lensR,  lensG,  lensB;
+    BYTE shineR, shineG, shineB;
+};
+
+static IconPalette PaletteFor(bool flash)
+{
+    if (flash) return IconPalette{ 16, 185, 129,   8,  92,  66, 170, 255, 214 };
+    return        IconPalette{ 31, 111, 229,  16,  58, 120, 170, 210, 255 };
+}
+
+static HICON MakeAppIcon(int size, bool flash)
 {
     const int SS = 4;                    // 超采样倍数，用于抗锯齿
     const int big = size * SS;
+    const IconPalette P = PaletteFor(flash);
 
     Canvas c(big);
 
-    // 机身：蓝色圆角矩形
+    // 机身：圆角矩形（蓝 / 变色时绿）
     c.roundRect(big * 0.06, big * 0.24, big * 0.94, big * 0.94, big * 0.14,
-                31, 111, 229);
+                P.bodyR, P.bodyG, P.bodyB);
     // 顶部取景凸起
     c.roundRect(big * 0.34, big * 0.13, big * 0.66, big * 0.30, big * 0.05,
-                31, 111, 229);
+                P.bodyR, P.bodyG, P.bodyB);
     // 镜头白圈
     c.circle(big * 0.50, big * 0.60, big * 0.245, 255, 255, 255);
     // 镜头深色
-    c.circle(big * 0.50, big * 0.60, big * 0.165, 16, 58, 120);
+    c.circle(big * 0.50, big * 0.60, big * 0.165, P.lensR, P.lensG, P.lensB);
     // 高光
-    c.circle(big * 0.44, big * 0.54, big * 0.052, 170, 210, 255);
+    c.circle(big * 0.44, big * 0.54, big * 0.052, P.shineR, P.shineG, P.shineB);
     // 右上闪光灯
     c.roundRect(big * 0.72, big * 0.32, big * 0.84, big * 0.42, big * 0.03,
                 235, 245, 255);
@@ -757,7 +789,8 @@ static void AddRoundRectF(GraphicsPath& path, const RectF& r, float rad)
 }
 
 // 生成带透明通道的球形位图（GDI+ 抗锯齿绘制）
-static HBITMAP MakeBallBitmap(int size, bool hover, bool pressed)
+// flash = true 时整球改绿色，用于截图成功后的即时回执
+static HBITMAP MakeBallBitmap(int size, bool hover, bool pressed, bool flash)
 {
     Bitmap bmp(size, size, PixelFormat32bppARGB);
     Graphics g(&bmp);
@@ -775,7 +808,7 @@ static HBITMAP MakeBallBitmap(int size, bool hover, bool pressed)
     for (int i = 3; i >= 1; --i) {
         float grow = (float)i * 0.9f;
         BYTE a = (BYTE)(hover ? 26 : 16);
-        Pen glow(Color(a, 70, 140, 235), grow * 1.6f);
+        Pen glow(flash ? Color(a, 40, 200, 140) : Color(a, 70, 140, 235), grow * 1.6f);
         g.DrawEllipse(&glow, rc.X - grow, rc.Y - grow, d + grow * 2, d + grow * 2);
     }
 
@@ -784,7 +817,9 @@ static HBITMAP MakeBallBitmap(int size, bool hover, bool pressed)
     circle.AddEllipse(rc);
     PathGradientBrush pg(&circle);
     pg.SetCenterPoint(PointF(cx - d * 0.20f, cy - d * 0.22f));
-    if (pressed)
+    if (flash)
+        pg.SetCenterColor(Color(255, 52, 211, 153));
+    else if (pressed)
         pg.SetCenterColor(Color(255, 70, 150, 235));
     else if (hover)
         pg.SetCenterColor(Color(255, 125, 205, 255));
@@ -792,9 +827,10 @@ static HBITMAP MakeBallBitmap(int size, bool hover, bool pressed)
         pg.SetCenterColor(Color(255, 96, 176, 246));
 
     Color surround[1];
-    surround[0] = pressed ? Color(255, 8, 62, 140)
-                : hover   ? Color(255, 14, 88, 196)
-                          : Color(255, 10, 72, 165);
+    surround[0] = flash    ? Color(255, 6, 95, 70)
+                : pressed  ? Color(255, 8, 62, 140)
+                : hover    ? Color(255, 14, 88, 196)
+                           : Color(255, 10, 72, 165);
     int nSur = 1;
     pg.SetSurroundColors(surround, &nSur);
     g.FillPath(&pg, &circle);
@@ -837,7 +873,9 @@ static HBITMAP MakeBallBitmap(int size, bool hover, bool pressed)
         g.FillPath(&white, &bodyPath);
 
         // 镜头
-        SolidBrush lens(pressed ? Color(255, 20, 84, 168) : Color(255, 26, 108, 200));
+        SolidBrush lens(flash    ? Color(255, 6, 78, 56)
+                       : pressed ? Color(255, 20, 84, 168)
+                                 : Color(255, 26, 108, 200));
         float lr = d * 0.105f;
         g.FillEllipse(&lens, cx - lr, cy - lr + d * 0.05f, lr * 2, lr * 2);
 
@@ -857,7 +895,7 @@ static void BallUpdate()
 {
     if (!g_hwndBall) return;
 
-    HBITMAP bmp = MakeBallBitmap(g_ballSize, g_ballHover, g_ballPressed);
+    HBITMAP bmp = MakeBallBitmap(g_ballSize, g_ballHover, g_ballPressed, g_flashing);
     if (!bmp) return;
 
     HDC hScreen = GetDC(nullptr);
@@ -1104,6 +1142,7 @@ static void Balloon(const std::wstring& title, const std::wstring& text, DWORD f
     g_nid.dwInfoFlags = flags;
     g_nid.uTimeout    = 3000;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    g_balloonUp = true;      // 记下气泡状态，变色恢复要等它关闭后再动图标
 
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
 }
@@ -1116,7 +1155,9 @@ static void AddTrayIcon()
     g_nid.uID              = ID_TRAY_ICON;
     g_nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY_MSG;
-    g_nid.hIcon            = g_hiconSmall ? g_hiconSmall : LoadIcon(nullptr, IDI_APPLICATION);
+    // 首次添加时也可能正处在变色期间（例如 explorer 重启），按当前状态选图标
+    HICON small = (g_flashing && g_hiconSmallFlash) ? g_hiconSmallFlash : g_hiconSmall;
+    g_nid.hIcon            = small ? small : LoadIcon(nullptr, IDI_APPLICATION);
 
     std::wstring tip = std::wstring(L"QuickShot  ") +
                        HotkeyText(g_cfg.mod, g_cfg.vk) + L" 全屏 / " +
@@ -1139,6 +1180,57 @@ static void UpdateTrayTip()
 static void RemoveTrayIcon()
 {
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
+}
+
+// 换用正常色 / 变色图标。图标在启动时就两套都备好，这里只做指针切换，
+// 避免在截图路径上现画一张图把回执拖慢。
+static void ApplyTrayIcon(bool flash)
+{
+    if (!g_nid.hWnd) return;
+    HICON ic = (flash && g_hiconSmallFlash) ? g_hiconSmallFlash : g_hiconSmall;
+    if (!ic) return;
+
+    g_nid.hIcon  = ic;
+    g_nid.uFlags = NIF_ICON;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;   // 与 Balloon() 的收尾保持一致
+}
+
+// 截图成功后：托盘图标和悬浮球一起变绿约半秒再恢复。
+// 气泡提示容易被忽略，连拍时更需要一个「这张确实存下来了」的即时信号。
+static void FlashCaptureFeedback()
+{
+    g_flashing   = true;
+    g_flashStart = GetTickCount64();
+    ApplyTrayIcon(true);
+    BallUpdate();
+
+    if (g_hwndMain) {
+        KillTimer(g_hwndMain, IDT_FLASH);          // 连拍时重新计时，不要提前复位
+        SetTimer(g_hwndMain, IDT_FLASH, FLASH_ON_MS, nullptr);
+    }
+}
+
+static void EndCaptureFlash()
+{
+    if (!g_flashing) return;
+
+    // Shell 的行为：气泡显示期间对图标做一次 NIM_MODIFY，会把气泡直接关掉，
+    // 于是「点气泡打开所在文件夹」就没了。所以这里宁可让托盘多绿一会儿，
+    // 也等气泡自己关闭再复位；悬浮球不受影响，已经按时变回去了。
+    //
+    // 但气泡关闭事件并非所有 Shell 版本都会发（explorer 重启、第三方任务栏等），
+    // 所以必须有个兜底时限，否则图标会永久绿下去、定时器还会空转。
+    if (g_balloonUp && g_hwndMain &&
+        GetTickCount64() - g_flashStart < FLASH_HOLD_MAX_MS) {
+        SetTimer(g_hwndMain, IDT_FLASH, 200, nullptr);
+        return;
+    }
+    if (g_balloonUp) g_balloonUp = false;   // 兜底路径：不再等这个气泡
+
+    g_flashing = false;
+    ApplyTrayIcon(false);
+    BallUpdate();
 }
 
 // ---------------------------------------------------------------------------
@@ -1832,6 +1924,8 @@ static void DoCapture()
     size_t k = name.find_last_of(L'\\');
     if (k != std::wstring::npos) name = name.substr(k + 1);
 
+    // 先让图标变色，再弹气泡：气泡本身也会 NIM_MODIFY，顺序反过来会让绿色那一下丢失
+    FlashCaptureFeedback();
     Balloon(L"截图已保存", name + L"\n（点击打开所在文件夹）");
 }
 
@@ -2388,6 +2482,7 @@ static void DoSelectCapture()
     std::wstring name = path;
     size_t k = name.find_last_of(L'\\');
     if (k != std::wstring::npos) name = name.substr(k + 1);
+    FlashCaptureFeedback();
     Balloon(L"截图已保存",
             name + L"\n" + ItoS(aw) + L" × " + ItoS(ah) +
             L"\n（点击打开所在文件夹）");
@@ -2581,10 +2676,26 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
             break;
         }
         case NIN_BALLOONUSERCLICK:
+            g_balloonUp = false;
             RevealFile(g_lastSaved);
+            EndCaptureFlash();
             break;
+
+        case NIN_BALLOONTIMEOUT:
+        case NIN_BALLOONHIDE:
+            g_balloonUp = false;
+            EndCaptureFlash();      // 气泡关了，补做被推迟的图标复位
+            break;
+
         default:
             break;
+        }
+        return 0;
+
+    case WM_TIMER:
+        if (w == IDT_FLASH) {
+            KillTimer(h, IDT_FLASH);
+            EndCaptureFlash();
         }
         return 0;
 
@@ -2604,13 +2715,18 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
 
     case WM_DESTROY:
+        KillTimer(h, IDT_FLASH);
         RemoveTrayIcon();
         PostQuitMessage(0);
         return 0;
 
     default:
         if (m == g_msgTaskbarCreated && g_msgTaskbarCreated != 0) {
-            // 资源管理器重启后重新加回托盘图标
+            // 资源管理器重启后重新加回托盘图标。
+            // 旧气泡随着 explorer 一起没了，不会再发关闭通知，这里手动清掉标记，
+            // 否则变色复位会一直等一个永远不会来的事件（直到撞上兜底时限）。
+            // 图标颜色由 AddTrayIcon 按当前 g_flashing 重新决定，不必额外补刷。
+            g_balloonUp = false;
             AddTrayIcon();
             return 0;
         }
@@ -2716,10 +2832,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
-    g_hiconBig   = MakeAppIcon(32);
-    g_hiconSmall = MakeAppIcon(16);
+    g_hiconBig        = MakeAppIcon(32, false);
+    g_hiconSmall      = MakeAppIcon(16, false);
+    g_hiconBigFlash   = MakeAppIcon(32, true);
+    g_hiconSmallFlash = MakeAppIcon(16, true);
     if (!g_hiconBig)   g_hiconBig   = LoadIcon(nullptr, IDI_APPLICATION);
     if (!g_hiconSmall) g_hiconSmall = LoadIcon(nullptr, IDI_APPLICATION);
+    // 变色图标只是反馈用的锦上添花；万一画不出来就留空，
+    // ApplyTrayIcon 会自动退回普通图标，不能因为它失败而拦住启动
 
     if (!RegisterClasses()) {
         MessageBoxW(nullptr, L"窗口类注册失败。", APP_NAME, MB_ICONERROR | MB_OK);
@@ -2769,7 +2889,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
                          L" 全屏截图\n按 " + HotkeyText(g_cfg.mod2, g_cfg.vk2) +
                          L" 区域 / 窗口截图，或点击悬浮球";
     if (IsPortable())
-        hello += L"\n截图自动存到程序目录下的 Screenshots";
+        hello += std::wstring(L"\n截图自动存到程序目录下的 ") + SHOT_FOLDER;
     Balloon(L"QuickShot 已启动", hello);
 
     MSG msg;
@@ -2779,8 +2899,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     }
 
     if (hookFg) UnhookWinEvent(hookFg);
-    if (g_hiconBig)   DestroyIcon(g_hiconBig);
-    if (g_hiconSmall) DestroyIcon(g_hiconSmall);
+    if (g_hiconBig)        DestroyIcon(g_hiconBig);
+    if (g_hiconSmall)      DestroyIcon(g_hiconSmall);
+    if (g_hiconBigFlash)   DestroyIcon(g_hiconBigFlash);
+    if (g_hiconSmallFlash) DestroyIcon(g_hiconSmallFlash);
     if (g_font)       DeleteObject(g_font);
     if (g_fontBold)   DeleteObject(g_fontBold);
 
