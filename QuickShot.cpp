@@ -9,6 +9,7 @@
 //    5. 可选开机自启、截图后气泡提示
 //    6. 区域 / 窗口截图：拖框选区域、单击选窗口、W 窗口吸附、F 整屏
 //    7. 每次截图后托盘图标与悬浮球由蓝变红 0.2 秒，作为「已存盘」的视觉回执
+//    8. 可选「截图前先命名」：抓屏后弹命名框，输入并回车才存盘，Esc 则丢弃这张
 //
 //  构建：见 build_msvc.bat / build_mingw.bat
 // ============================================================================
@@ -74,6 +75,7 @@ enum {
     IDM_ABOUT,
     IDM_EXIT,
     IDM_SELECT,                // 区域 / 窗口截图（菜单入口）
+    IDM_TOGGLE_NAMING,         // 切换「截图前先命名」
     IDM_FOLDER_BASE = 1100,
     IDM_FOLDER_ITEM = 2000      // 动态子文件夹项起点
 };
@@ -82,6 +84,7 @@ enum {
 #define CLS_MAIN     L"QS_MainWnd"
 #define CLS_KEYBOX   L"QS_KeyBox"
 #define CLS_NEWFOLDER L"QS_NewFolder"
+#define CLS_NAMING   L"QS_Naming"
 #define CLS_SETTINGS L"QS_Settings"
 #define CLS_SELECT   L"QS_SelectWnd"
 #define CLS_PREVIEW  L"QS_PreviewWnd"
@@ -98,6 +101,7 @@ struct Config {
     bool         balloon = true;                  // 截图后气泡提示
     bool         autostart = false;               // 开机自启
     bool         ball = true;                     // 显示桌面悬浮球
+    bool         nameMode = false;                // 每张截图先弹命名框，人工输入后再存盘
     int          ballX = -1;                      // 悬浮球位置（-1 = 未设置）
     int          ballY = -1;
 };
@@ -303,6 +307,7 @@ static void LoadConfig()
     if (IsPortable()) g_cfg.autostart = false;   // U 盘盘符会变，不能做开机自启
 
     g_cfg.ball      = GetPrivateProfileIntW(L"ui", L"ball", 1, f.c_str()) != 0;
+    g_cfg.nameMode  = GetPrivateProfileIntW(L"ui", L"nameMode", 0, f.c_str()) != 0;
     g_cfg.ballX     = GetPrivateProfileIntW(L"ui", L"ballX", -1, f.c_str());
     g_cfg.ballY     = GetPrivateProfileIntW(L"ui", L"ballY", -1, f.c_str());
 }
@@ -322,6 +327,7 @@ static void SaveConfig()
     WritePrivateProfileStringW(L"ui", L"balloon",   g_cfg.balloon ? L"1" : L"0", f.c_str());
     WritePrivateProfileStringW(L"ui", L"autostart", g_cfg.autostart ? L"1" : L"0", f.c_str());
     WritePrivateProfileStringW(L"ui", L"ball", g_cfg.ball ? L"1" : L"0", f.c_str());
+    WritePrivateProfileStringW(L"ui", L"nameMode", g_cfg.nameMode ? L"1" : L"0", f.c_str());
     WritePrivateProfileStringW(L"ui", L"ballX", ItoS(g_cfg.ballX).c_str(), f.c_str());
     WritePrivateProfileStringW(L"ui", L"ballY", ItoS(g_cfg.ballY).c_str(), f.c_str());
 }
@@ -574,13 +580,19 @@ static int GetEncoderClsid(const wchar_t* mime, CLSID* clsid)
     return -1;
 }
 
+// 当前图片格式对应的扩展名；自动命名和人工命名共用，避免两处各写一遍
+static const wchar_t* CurrentExt()
+{
+    return (g_cfg.format == 1) ? L".jpg"
+         : (g_cfg.format == 2) ? L".bmp" : L".png";
+}
+
 static std::wstring MakeFilePath()
 {
     SYSTEMTIME st;
     GetLocalTime(&st);
 
-    const wchar_t* ext = (g_cfg.format == 1) ? L".jpg"
-                       : (g_cfg.format == 2) ? L".bmp" : L".png";
+    const wchar_t* ext = CurrentExt();
 
     std::wstring stem = g_cfg.prefix + L"_" +
                         ItoS(st.wYear) + Pad2(st.wMonth) + Pad2(st.wDay) + L"_" +
@@ -682,8 +694,13 @@ static int ClampInt(int v, int lo, int hi)
 }
 
 // area 用 DIB 像素坐标（左上角为 0,0），越界部分自动裁到画面内
+// 命名模式（g_cfg.nameMode）下先弹命名框：画面此时已经抓进内存，
+// 所以命名框本身不会出现在截图里；用户取消则 cancelled=true，调用方静默放弃。
+static bool AskCaptureName(const ScreenImage& img, const RECT& area, std::wstring* outName);
+
 static bool SaveDibRegion(const ScreenImage& img, const RECT& area,
-                          std::wstring* outPath, std::wstring* err)
+                          std::wstring* outPath, std::wstring* err,
+                          bool* cancelled = nullptr)
 {
     RECT r = area;
     r.left   = ClampInt(r.left,   0, img.w);
@@ -703,7 +720,19 @@ static bool SaveDibRegion(const ScreenImage& img, const RECT& area,
         return false;
     }
 
-    std::wstring path = MakeFilePath();
+    std::wstring path;
+    if (g_cfg.nameMode) {
+        std::wstring nm;
+        if (!AskCaptureName(img, r, &nm)) {
+            if (cancelled) *cancelled = true;
+            // 兜一句可读的说明：即便调用方漏判 cancelled，也不会弹出空白「截图失败」
+            if (err) *err = L"已取消，未保存。";
+            return false;
+        }
+        path = dir + L"\\" + nm + CurrentExt();
+    } else {
+        path = MakeFilePath();
+    }
     const wchar_t* mime = (g_cfg.format == 1) ? L"image/jpeg"
                         : (g_cfg.format == 2) ? L"image/bmp" : L"image/png";
     CLSID clsid;
@@ -757,12 +786,12 @@ static bool SaveDibRegion(const ScreenImage& img, const RECT& area,
     return true;
 }
 
-static bool CaptureAndSave(std::wstring* outPath, std::wstring* err)
+static bool CaptureAndSave(std::wstring* outPath, std::wstring* err, bool* cancelled = nullptr)
 {
     ScreenImage img;
     if (!GrabScreen(&img, err)) return false;
     RECT all = { 0, 0, img.w, img.h };
-    bool ok = SaveDibRegion(img, all, outPath, err);
+    bool ok = SaveDibRegion(img, all, outPath, err, cancelled);
     img.Free();
     return ok;
 }
@@ -1677,6 +1706,202 @@ static bool NewFolderDialog(HWND owner, const std::wstring& root, NFState* out)
 }
 
 // ---------------------------------------------------------------------------
+// 截图命名框（命名模式）
+//   进到这里时画面已经抓进内存了，所以这个窗口本身不会被截进图里。
+//   输入框预填本来要用的自动文件名，直接回车就等于沿用自动名；
+//   重名不自动加序号（那是自动命名的规矩），人工命名改成问一句是否覆盖。
+//   回车 / Esc 沿用新建文件夹那套输入框子类化，理由见 NFEditProc 上方注释。
+// ---------------------------------------------------------------------------
+#define IDC_NM_EDIT  310
+
+struct NMState {
+    std::wstring name;        // 预填的文件名主干（不含扩展名）
+    std::wstring dir;         // 落盘目录，只用于提示
+    std::wstring hint;        // 画面尺寸 / 扩展名说明
+    bool  ok = false;
+    HWND  hEdit    = nullptr;
+    HWND  hPreview = nullptr;
+};
+
+// 自动命名的文件名主干：取 MakeFilePath 的结果，去掉目录和扩展名
+static std::wstring DefaultNameStem()
+{
+    std::wstring p = MakeFilePath();
+    size_t k = p.find_last_of(L'\\');
+    std::wstring f = (k == std::wstring::npos) ? p : p.substr(k + 1);
+    size_t d = f.find_last_of(L'.');
+    return (d == std::wstring::npos) ? f : f.substr(0, d);
+}
+
+static void NMUpdatePreview(NMState* st)
+{
+    if (!st->hPreview || !st->hEdit) return;
+
+    wchar_t buf[512] = {0};
+    GetWindowTextW(st->hEdit, buf, 512);
+    std::wstring n = TrimSpace(buf);
+
+    if (n.empty()) {
+        SetWindowTextW(st->hPreview, L"（请先输入文件名，或按 Esc 放弃这张）");
+        return;
+    }
+    SetWindowTextW(st->hPreview, (NFJoin(st->dir, n) + CurrentExt()).c_str());
+}
+
+static LRESULT CALLBACK NamingProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    NMState* st = (NMState*)GetWindowLongPtrW(h, GWLP_USERDATA);
+
+    switch (m) {
+    case WM_NCCREATE: {
+        CREATESTRUCTW* cs = (CREATESTRUCTW*)l;
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+        return TRUE;
+    }
+    case WM_CREATE: {
+        NMState* s = (NMState*)GetWindowLongPtrW(h, GWLP_USERDATA);
+
+        CreateWindowExW(0, L"STATIC", L"文件名（不用写扩展名）：", WS_CHILD | WS_VISIBLE,
+                        S(20), S(18), S(300), S(20), h, nullptr, g_hInst, nullptr);
+
+        HWND e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", s->name.c_str(),
+                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                 S(20), S(42), S(430), S(28), h,
+                                 (HMENU)IDC_NM_EDIT, g_hInst, nullptr);
+        s->hEdit = e;
+
+        CreateWindowExW(0, L"STATIC", L"将保存为：", WS_CHILD | WS_VISIBLE,
+                        S(20), S(84), S(200), S(20), h, nullptr, g_hInst, nullptr);
+
+        s->hPreview = CreateWindowExW(0, L"STATIC", L"",
+                                      WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
+                                      S(20), S(106), S(430), S(40), h, nullptr, g_hInst, nullptr);
+
+        CreateWindowExW(0, L"STATIC", s->hint.c_str(), WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        S(20), S(152), S(430), S(20), h, nullptr, g_hInst, nullptr);
+
+        CreateWindowExW(0, L"BUTTON", L"保存",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                        S(290), S(186), S(76), S(30), h, (HMENU)IDOK, g_hInst, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"放弃这张",
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                        S(374), S(186), S(76), S(30), h, (HMENU)IDCANCEL, g_hInst, nullptr);
+
+        for (HWND c = GetWindow(h, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT))
+            SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE);
+
+        g_nfOldEdit = (WNDPROC)SetWindowLongPtrW(e, GWLP_WNDPROC, (LONG_PTR)NFEditProc);
+
+        SendMessageW(e, EM_SETSEL, 0, -1);
+        NMUpdatePreview(s);
+        return 0;
+    }
+    case WM_COMMAND: {
+        UINT id = LOWORD(w);
+
+        if (id == IDC_NM_EDIT && HIWORD(w) == EN_CHANGE) {
+            NMUpdatePreview(st);
+            return 0;
+        }
+
+        if (id == IDOK) {
+            wchar_t buf[512] = {0};
+            GetWindowTextW(st->hEdit, buf, 512);
+            std::wstring name = TrimSpace(buf);
+
+            if (name.empty()) {
+                MessageBoxW(h, L"请先输入文件名，或按 Esc 放弃这张。",
+                            APP_NAME, MB_ICONWARNING | MB_OK);
+                SetFocus(st->hEdit);
+                return 0;
+            }
+            if (name.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos) {
+                MessageBoxW(h, L"文件名不能包含下列字符：\n\\ / : * ? \" < > |",
+                            APP_NAME, MB_ICONWARNING | MB_OK);
+                return 0;
+            }
+            if (name.back() == L'.' || name.back() == L' ') {
+                MessageBoxW(h, L"文件名不能以点或空格结尾。", APP_NAME,
+                            MB_ICONWARNING | MB_OK);
+                return 0;
+            }
+            if (name.size() > 120) {
+                MessageBoxW(h, L"文件名太长了，请控制在 120 个字符以内。",
+                            APP_NAME, MB_ICONWARNING | MB_OK);
+                return 0;
+            }
+
+            std::wstring full = NFJoin(st->dir, name) + CurrentExt();
+            if (PathFileExistsW(full.c_str())) {
+                std::wstring q = L"「" + name + CurrentExt() + L"」已经存在。\n\n是否覆盖它？";
+                if (MessageBoxW(h, q.c_str(), APP_NAME, MB_ICONQUESTION | MB_YESNO) != IDYES)
+                    return 0;
+            }
+
+            st->name = name;
+            st->ok   = true;
+            DestroyWindow(h);
+            return 0;
+        }
+
+        if (id == IDCANCEL) {
+            DestroyWindow(h);
+            return 0;
+        }
+        break;
+    }
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+// 弹出命名框；返回 true 时 outName 里是用户确认的文件名（不含扩展名）
+static bool AskCaptureName(const ScreenImage& img, const RECT& area, std::wstring* outName)
+{
+    NMState st;
+    st.name = DefaultNameStem();
+    st.dir  = SaveDir();
+
+    int aw = ClampInt(area.right - area.left, 0, img.w);
+    int ah = ClampInt(area.bottom - area.top,  0, img.h);
+    st.hint = L"画面 " + ItoS(aw) + L" × " + ItoS(ah) +
+              L" 像素；扩展名 " + CurrentExt() + L" 由「设置」里的格式决定";
+
+    // 客户区 470x232，外框由 AdjustWindowRectEx 算，避免按钮被标题栏挤掉
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    RECT rc = { 0, 0, S(470), S(232) };
+    AdjustWindowRectEx(&rc, style, FALSE, WS_EX_DLGMODALFRAME);
+    int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+
+    int x = (GetSystemMetrics(SM_CXSCREEN) - cw) / 2;
+    int y = (GetSystemMetrics(SM_CYSCREEN) - ch) / 2;
+
+    HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, CLS_NAMING, L"给这张截图命名",
+                             style, x, y, cw, ch, g_hwndMain, nullptr, g_hInst, &st);
+    if (!h) return false;
+
+    ShowWindow(h, SW_SHOW);
+    UpdateWindow(h);
+    SetForegroundWindow(h);
+    SetFocus(st.hEdit);
+    SendMessageW(st.hEdit, EM_SETSEL, 0, -1);
+
+    // RunModal 会把 g_modal 置起再落下，截图热键和菜单在此期间都进不来，
+    // 所以这里不必再防「命名框叠命名框」。
+    RunModal(h, nullptr);
+    if (!IsWindow(h)) {
+        if (st.ok && outName) *outName = st.name;
+        return st.ok;
+    }
+    DestroyWindow(h);
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // 设置窗口
 // ---------------------------------------------------------------------------
 struct SetState {
@@ -1925,12 +2150,15 @@ static void DoCapture()
     }
 
     std::wstring path, err;
-    bool ok = CaptureAndSave(&path, &err);
+    bool cancelled = false;
+    bool ok = CaptureAndSave(&path, &err, &cancelled);
 
     if (ballShown && g_hwndBall) {
         ShowWindow(g_hwndBall, SW_SHOWNA);
         BallEnsureTopmost();
     }
+
+    if (cancelled) return;      // 命名框里按了取消：静默放弃，不报失败也不变色
 
     if (!ok) {
         Balloon(L"截图失败", err, NIIF_ERROR);
@@ -2491,8 +2719,10 @@ static void DoSelectCapture()
     int ah = area.bottom - area.top;
 
     std::wstring path;
-    bool ok = SaveDibRegion(st.img, area, &path, &err);
+    bool cancelled = false;
+    bool ok = SaveDibRegion(st.img, area, &path, &err, &cancelled);
     st.img.Free();
+    if (cancelled) return;      // 命名框里取消：这张不存，也不算失败
     if (!ok) {
         Balloon(L"截图失败", err, NIIF_ERROR);
         return;
@@ -2570,6 +2800,8 @@ static void ShowAppMenu(POINT pt)
     AppendMenuW(m, MF_STRING, IDM_OPEN_FOLDER, L"打开保存文件夹");
     AppendMenuW(m, MF_STRING | (g_cfg.ball ? MF_CHECKED : 0),
                 IDM_TOGGLE_BALL, L"显示悬浮球");
+    AppendMenuW(m, MF_STRING | (g_cfg.nameMode ? MF_CHECKED : 0),
+                IDM_TOGGLE_NAMING, L"截图前先命名");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_SETTINGS, L"设置…");
     AppendMenuW(m, MF_STRING, IDM_ABOUT, L"关于");
@@ -2642,6 +2874,16 @@ static void ShowAppMenu(POINT pt)
     case IDM_TOGGLE_BALL:
         BallShow(!g_cfg.ball);
         break;
+    case IDM_TOGGLE_NAMING: {
+        g_cfg.nameMode = !g_cfg.nameMode;
+        SaveConfig();
+        if (g_cfg.nameMode)
+            Balloon(L"截图前先命名已开启",
+                    L"每张图先弹命名框，输入后回车保存；\n按 Esc = 放弃这张，不写任何文件");
+        else
+            Balloon(L"已恢复自动命名", g_cfg.prefix + L"_年月日_时分秒.png");
+        break;
+    }
     case IDM_SETTINGS:
         ShowSettings();
         break;
@@ -2789,6 +3031,10 @@ static bool RegisterClasses()
 
     wc.lpfnWndProc   = NewFolderProc;
     wc.lpszClassName = CLS_NEWFOLDER;
+    if (!RegisterClassExW(&wc)) return false;
+
+    wc.lpfnWndProc   = NamingProc;
+    wc.lpszClassName = CLS_NAMING;
     if (!RegisterClassExW(&wc)) return false;
 
     wc.lpfnWndProc   = SettingsProc;
