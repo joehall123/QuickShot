@@ -8,7 +8,7 @@
 //    4. 支持 PNG / JPEG / BMP，文件名前缀可自定义
 //    5. 可选开机自启、截图后气泡提示
 //    6. 区域 / 窗口截图：拖框选区域、单击选窗口、W 窗口吸附、F 整屏
-//    7. 每次截图后托盘图标与悬浮球短暂变色，作为「已存盘」的视觉回执
+//    7. 每次截图后托盘图标与悬浮球由蓝变红 0.2 秒，作为「已存盘」的视觉回执
 //
 //  构建：见 build_msvc.bat / build_mingw.bat
 // ============================================================================
@@ -61,8 +61,7 @@ static const wchar_t* SHOT_FOLDER = L"验证截图";
 #define ID_HOTKEY_CAPTURE  101
 #define ID_HOTKEY_SELECT   102
 #define IDT_FLASH          5      // 截图后图标变色的恢复定时器（挂在主隐藏窗口）
-#define FLASH_ON_MS        500    // 变色持续多久
-#define FLASH_HOLD_MAX_MS  4000   // 气泡不肯关闭时，最多再拖这么久就必须复位（兜底）
+#define FLASH_ON_MS        200    // 变色持续多久：蓝→红 0.2 秒后回到蓝
 
 // 菜单命令
 enum {
@@ -110,8 +109,13 @@ static HICON     g_hiconSmall = nullptr;
 static HICON     g_hiconBigFlash   = nullptr;   // 截图反馈用的变色图标
 static HICON     g_hiconSmallFlash = nullptr;
 static bool      g_flashing   = false;          // true = 正处于变色回执期间
-static bool      g_balloonUp  = false;          // 气泡仍在显示（此时改图标会被 Shell 关掉气泡）
-static ULONGLONG g_flashStart = 0;              // 本次变色的起始时刻，用于兜底复位
+// 气泡要等变色复位之后再弹：Shell 在气泡显示期间收到一次改图标的 NIM_MODIFY
+// 会把气泡直接关掉，「点气泡打开所在文件夹」就跟着没了。变色只有 0.2 秒，
+// 晚一点点弹气泡没人感觉得到，比丢功能划算。
+static bool         g_balloonPending = false;
+static std::wstring g_balloonTitle;
+static std::wstring g_balloonText;
+static DWORD        g_balloonFlags = NIIF_INFO;
 static UINT      g_msgTaskbarCreated = 0;
 static HFONT     g_font       = nullptr;
 static HFONT     g_fontBold   = nullptr;
@@ -135,6 +139,9 @@ static void BallClampToScreen();
 static void BallEnsureTopmost();
 static void BallUpdate();
 static void FlashCaptureFeedback();   // 截图成功后的图标变色（定义在托盘一节）
+static void EndCaptureFlash();        // 变色到点复位，并补发挂起的气泡
+static void QueueBalloonAfterFlash(const std::wstring& title, const std::wstring& text,
+                                   DWORD flags);
 
 // ---------------------------------------------------------------------------
 // 小工具
@@ -387,7 +394,7 @@ struct Canvas {
     }
 };
 
-// 图标配色：平时蓝色，截图成功的那一瞬间换成绿色，作为「已存盘」的即时信号
+// 图标配色：平时蓝色，截图成功的那一瞬间换成红色，作为「已存盘」的即时信号
 struct IconPalette {
     BYTE bodyR,  bodyG,  bodyB;
     BYTE lensR,  lensG,  lensB;
@@ -396,8 +403,8 @@ struct IconPalette {
 
 static IconPalette PaletteFor(bool flash)
 {
-    if (flash) return IconPalette{ 16, 185, 129,   8,  92,  66, 170, 255, 214 };
-    return        IconPalette{ 31, 111, 229,  16,  58, 120, 170, 210, 255 };
+    if (flash) return IconPalette{ 229,  57,  53,  92,  14,  14, 255, 199, 190 };
+    return        IconPalette{  31, 111, 229,  16,  58, 120, 170, 210, 255 };
 }
 
 static HICON MakeAppIcon(int size, bool flash)
@@ -408,7 +415,7 @@ static HICON MakeAppIcon(int size, bool flash)
 
     Canvas c(big);
 
-    // 机身：圆角矩形（蓝 / 变色时绿）
+    // 机身：圆角矩形（蓝 / 变色时红）
     c.roundRect(big * 0.06, big * 0.24, big * 0.94, big * 0.94, big * 0.14,
                 P.bodyR, P.bodyG, P.bodyB);
     // 顶部取景凸起
@@ -789,7 +796,7 @@ static void AddRoundRectF(GraphicsPath& path, const RectF& r, float rad)
 }
 
 // 生成带透明通道的球形位图（GDI+ 抗锯齿绘制）
-// flash = true 时整球改绿色，用于截图成功后的即时回执
+// flash = true 时整球改红色，用于截图成功后的即时回执
 static HBITMAP MakeBallBitmap(int size, bool hover, bool pressed, bool flash)
 {
     Bitmap bmp(size, size, PixelFormat32bppARGB);
@@ -808,7 +815,7 @@ static HBITMAP MakeBallBitmap(int size, bool hover, bool pressed, bool flash)
     for (int i = 3; i >= 1; --i) {
         float grow = (float)i * 0.9f;
         BYTE a = (BYTE)(hover ? 26 : 16);
-        Pen glow(flash ? Color(a, 40, 200, 140) : Color(a, 70, 140, 235), grow * 1.6f);
+        Pen glow(flash ? Color(a, 225, 70, 62) : Color(a, 70, 140, 235), grow * 1.6f);
         g.DrawEllipse(&glow, rc.X - grow, rc.Y - grow, d + grow * 2, d + grow * 2);
     }
 
@@ -818,7 +825,7 @@ static HBITMAP MakeBallBitmap(int size, bool hover, bool pressed, bool flash)
     PathGradientBrush pg(&circle);
     pg.SetCenterPoint(PointF(cx - d * 0.20f, cy - d * 0.22f));
     if (flash)
-        pg.SetCenterColor(Color(255, 52, 211, 153));
+        pg.SetCenterColor(Color(255, 244, 93, 82));
     else if (pressed)
         pg.SetCenterColor(Color(255, 70, 150, 235));
     else if (hover)
@@ -827,7 +834,7 @@ static HBITMAP MakeBallBitmap(int size, bool hover, bool pressed, bool flash)
         pg.SetCenterColor(Color(255, 96, 176, 246));
 
     Color surround[1];
-    surround[0] = flash    ? Color(255, 6, 95, 70)
+    surround[0] = flash    ? Color(255, 112, 12, 10)
                 : pressed  ? Color(255, 8, 62, 140)
                 : hover    ? Color(255, 14, 88, 196)
                            : Color(255, 10, 72, 165);
@@ -873,7 +880,7 @@ static HBITMAP MakeBallBitmap(int size, bool hover, bool pressed, bool flash)
         g.FillPath(&white, &bodyPath);
 
         // 镜头
-        SolidBrush lens(flash    ? Color(255, 6, 78, 56)
+        SolidBrush lens(flash    ? Color(255, 78, 6, 6)
                        : pressed ? Color(255, 20, 84, 168)
                                  : Color(255, 26, 108, 200));
         float lr = d * 0.105f;
@@ -1142,7 +1149,6 @@ static void Balloon(const std::wstring& title, const std::wstring& text, DWORD f
     g_nid.dwInfoFlags = flags;
     g_nid.uTimeout    = 3000;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-    g_balloonUp = true;      // 记下气泡状态，变色恢复要等它关闭后再动图标
 
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
 }
@@ -1196,41 +1202,54 @@ static void ApplyTrayIcon(bool flash)
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;   // 与 Balloon() 的收尾保持一致
 }
 
-// 截图成功后：托盘图标和悬浮球一起变绿约半秒再恢复。
+// 截图成功后：托盘图标和悬浮球一起变红 0.2 秒再恢复蓝色。
 // 气泡提示容易被忽略，连拍时更需要一个「这张确实存下来了」的即时信号。
 static void FlashCaptureFeedback()
 {
-    g_flashing   = true;
-    g_flashStart = GetTickCount64();
+    g_flashing = true;
     ApplyTrayIcon(true);
     BallUpdate();
 
     if (g_hwndMain) {
-        KillTimer(g_hwndMain, IDT_FLASH);          // 连拍时重新计时，不要提前复位
+        // 连拍时重新计时并只保留最后一条气泡：既不提前复位，也不会攒出一串气泡
+        KillTimer(g_hwndMain, IDT_FLASH);
         SetTimer(g_hwndMain, IDT_FLASH, FLASH_ON_MS, nullptr);
+    } else {
+        EndCaptureFlash();      // 没有主窗口就没有定时器，立刻复位，别把气泡吊住
     }
+}
+
+// 把气泡挂起来，等变色复位之后再弹（见 g_balloonPending 的说明）
+static void QueueBalloonAfterFlash(const std::wstring& title, const std::wstring& text,
+                                   DWORD flags)
+{
+    g_balloonPending = true;
+    g_balloonTitle   = title;
+    g_balloonText    = text;
+    g_balloonFlags   = flags;
+}
+
+static void FlushQueuedBalloon()
+{
+    if (!g_balloonPending) return;
+    g_balloonPending = false;
+
+    std::wstring title = g_balloonTitle;
+    std::wstring text  = g_balloonText;
+    DWORD        flags = g_balloonFlags;
+    Balloon(title, text, flags);
 }
 
 static void EndCaptureFlash()
 {
     if (!g_flashing) return;
 
-    // Shell 的行为：气泡显示期间对图标做一次 NIM_MODIFY，会把气泡直接关掉，
-    // 于是「点气泡打开所在文件夹」就没了。所以这里宁可让托盘多绿一会儿，
-    // 也等气泡自己关闭再复位；悬浮球不受影响，已经按时变回去了。
-    //
-    // 但气泡关闭事件并非所有 Shell 版本都会发（explorer 重启、第三方任务栏等），
-    // 所以必须有个兜底时限，否则图标会永久绿下去、定时器还会空转。
-    if (g_balloonUp && g_hwndMain &&
-        GetTickCount64() - g_flashStart < FLASH_HOLD_MAX_MS) {
-        SetTimer(g_hwndMain, IDT_FLASH, 200, nullptr);
-        return;
-    }
-    if (g_balloonUp) g_balloonUp = false;   // 兜底路径：不再等这个气泡
-
     g_flashing = false;
     ApplyTrayIcon(false);
     BallUpdate();
+
+    // 图标已经回到蓝色，此时再弹气泡不会被自己顶掉
+    FlushQueuedBalloon();
 }
 
 // ---------------------------------------------------------------------------
@@ -1924,9 +1943,10 @@ static void DoCapture()
     size_t k = name.find_last_of(L'\\');
     if (k != std::wstring::npos) name = name.substr(k + 1);
 
-    // 先让图标变色，再弹气泡：气泡本身也会 NIM_MODIFY，顺序反过来会让绿色那一下丢失
+    // 图标变色和气泡都要走一次 NIM_MODIFY，同一帧里做两件事的话气泡会把变红那一下顶掉，
+    // 所以这里只把气泡挂起，等 0.2 秒变色复位完再弹。
     FlashCaptureFeedback();
-    Balloon(L"截图已保存", name + L"\n（点击打开所在文件夹）");
+    QueueBalloonAfterFlash(L"截图已保存", name + L"\n（点击打开所在文件夹）", NIIF_INFO);
 }
 
 // ---------------------------------------------------------------------------
@@ -2483,9 +2503,9 @@ static void DoSelectCapture()
     size_t k = name.find_last_of(L'\\');
     if (k != std::wstring::npos) name = name.substr(k + 1);
     FlashCaptureFeedback();
-    Balloon(L"截图已保存",
+    QueueBalloonAfterFlash(L"截图已保存",
             name + L"\n" + ItoS(aw) + L" × " + ItoS(ah) +
-            L"\n（点击打开所在文件夹）");
+            L"\n（点击打开所在文件夹）", NIIF_INFO);
     ShowPreview(path, aw, ah);
 }
 
@@ -2676,15 +2696,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
             break;
         }
         case NIN_BALLOONUSERCLICK:
-            g_balloonUp = false;
+            // 气泡是变色复位之后才弹的，图标此时已经是蓝色，这里只管点开文件夹
             RevealFile(g_lastSaved);
-            EndCaptureFlash();
-            break;
-
-        case NIN_BALLOONTIMEOUT:
-        case NIN_BALLOONHIDE:
-            g_balloonUp = false;
-            EndCaptureFlash();      // 气泡关了，补做被推迟的图标复位
             break;
 
         default:
@@ -2723,10 +2736,9 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
     default:
         if (m == g_msgTaskbarCreated && g_msgTaskbarCreated != 0) {
             // 资源管理器重启后重新加回托盘图标。
-            // 旧气泡随着 explorer 一起没了，不会再发关闭通知，这里手动清掉标记，
-            // 否则变色复位会一直等一个永远不会来的事件（直到撞上兜底时限）。
+            // 挂在队列里还没弹的气泡随着 explorer 一起没了，丢掉即可；
             // 图标颜色由 AddTrayIcon 按当前 g_flashing 重新决定，不必额外补刷。
-            g_balloonUp = false;
+            g_balloonPending = false;
             AddTrayIcon();
             return 0;
         }
